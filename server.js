@@ -4,24 +4,25 @@ app.use(express.json());
 
 // ─── Environment Variables ───────────────────────────────────────────────────
 const {
-  ULTRAMSG_INSTANCE_ID,
-  ULTRAMSG_TOKEN,
-  SHOPIFY_STORE_URL,    // e.g. your-store.myshopify.com
-  SHOPIFY_ADMIN_TOKEN,  // shpat_...
-  ODOO_URL,             // e.g. https://yourstore.odoo.com
+  META_PHONE_NUMBER_ID,   // e.g. 123456789012345
+  META_ACCESS_TOKEN,      // permanent token from Meta for Developers
+  META_VERIFY_TOKEN,      // any secret string you choose for webhook verification
+  SHOPIFY_STORE_URL,      // mymayzshop.myshopify.com
+  SHOPIFY_ADMIN_TOKEN,    // shpat_... or offline token
+  ODOO_URL,               // https://yourstore.odoo.com
   ODOO_DB,
   ODOO_USERNAME,
   ODOO_PASSWORD,
   PORT = 3000,
 } = process.env;
 
-// ─── In-memory state: pending confirmations ──────────────────────────────────
-// key: customer phone (E.164), value: { orderId, shopifyOrderId, paymentMethod, amount, currency, retried, retryTimer, noReplyTimer }
+// ─── In-memory pending orders ─────────────────────────────────────────────────
+// key: customer phone (E.164 without +), value: order info + timers
 const pendingOrders = {};
 
-// ─── Arabic message templates ────────────────────────────────────────────────
-function msgConfirmation(orderName, paymentMethod, total, currency) {
-  const payLabel = paymentMethod === 'cod' ? 'الدفع عند الاستلام' : 'بطاقة ائتمان';
+// ─── Arabic message templates ─────────────────────────────────────────────────
+function msgConfirmation(orderName, isCOD, total, currency) {
+  const payLabel = isCOD ? 'الدفع عند الاستلام' : 'بطاقة ائتمان';
   return (
     `مرحباً! تم استلام طلبك *${orderName}* بنجاح 🎉\n` +
     `طريقة الدفع: ${payLabel}\n` +
@@ -31,22 +32,18 @@ function msgConfirmation(orderName, paymentMethod, total, currency) {
     `*2* - إلغاء الطلب ❌`
   );
 }
-
 function msgConfirmed(orderName) {
   return `شكراً! تم تأكيد طلبك *${orderName}* وسيتم تجهيزه قريباً 🚀`;
 }
-
 function msgCancelledCOD(orderName) {
   return `تم إلغاء طلبك *${orderName}* بنجاح. نأمل خدمتك في المرة القادمة 🙏`;
 }
-
 function msgCancelledCard(orderName, amount, currency) {
   return (
     `تم إلغاء طلبك *${orderName}* وسيتم استرداد مبلغ ${amount} ${currency} خلال 5-7 أيام عمل إلى بطاقتك 💳\n` +
     `شكراً لتعاملك معنا 🙏`
   );
 }
-
 function msgRetry(orderName) {
   return (
     `تذكير: طلبك *${orderName}* لا يزال ينتظر تأكيدك.\n\n` +
@@ -56,63 +53,31 @@ function msgRetry(orderName) {
   );
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Send a WhatsApp message via UltraMsg */
+// ─── Meta WhatsApp Cloud API ──────────────────────────────────────────────────
 async function sendWhatsApp(phone, message) {
-  const url = `https://api.ultramsg.com/${ULTRAMSG_INSTANCE_ID}/messages/chat`;
-  const body = new URLSearchParams({
-    token: ULTRAMSG_TOKEN,
-    to: phone,
-    body: message,
-  });
+  // phone should be E.164 digits only, no "+"
+  const digits = phone.replace(/\D/g, '');
+  const url = `https://graph.facebook.com/v19.0/${META_PHONE_NUMBER_ID}/messages`;
+  const body = {
+    messaging_product: 'whatsapp',
+    to: digits,
+    type: 'text',
+    text: { body: message },
+  };
   const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
-  const data = await res.json();
-  console.log('[WA] Sent to', phone, '->', data);
-  return data;
-}
-
-/** Authenticate with Odoo JSON-RPC and return uid */
-async function odooAuth() {
-  const res = await fetch(`${ODOO_URL}/web/dataset/call_kw`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0', method: 'call', id: 1,
-      params: {
-        model: 'res.users',
-        method: 'authenticate',
-        args: [ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {}],
-        kwargs: {},
-      },
-    }),
-  });
-  const data = await res.json();
-  return data.result; // uid
-}
-
-/** Generic Odoo JSON-RPC call */
-async function odooCall(uid, model, method, args, kwargs = {}) {
-  const res = await fetch(`${ODOO_URL}/web/dataset/call_kw`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Cookie: `session_id=odoo_session`, // session handled below
+      Authorization: `Bearer ${META_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({
-      jsonrpc: '2.0', method: 'call', id: 1,
-      params: { model, method, args, kwargs },
-    }),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
-  return data.result;
+  console.log('[WA] Sent to', digits, '->', JSON.stringify(data));
+  return data;
 }
 
-/** Get Odoo session cookie by logging in */
+// ─── Odoo helpers ─────────────────────────────────────────────────────────────
 let odooSession = null;
 async function getOdooSession() {
   if (odooSession) return odooSession;
@@ -128,11 +93,10 @@ async function getOdooSession() {
   const match = setCookie.match(/session_id=([^;]+)/);
   if (match) odooSession = match[1];
   const data = await res.json();
-  console.log('[Odoo] Authenticated, uid:', data.result?.uid);
+  console.log('[Odoo] Auth uid:', data.result?.uid);
   return odooSession;
 }
 
-/** Generic Odoo call with session */
 async function odoo(model, method, args, kwargs = {}) {
   const session = await getOdooSession();
   const res = await fetch(`${ODOO_URL}/web/dataset/call_kw`, {
@@ -147,51 +111,51 @@ async function odoo(model, method, args, kwargs = {}) {
     }),
   });
   const data = await res.json();
-  if (data.error) {
-    console.error('[Odoo] Error:', JSON.stringify(data.error));
-    throw new Error(data.error.message);
-  }
+  if (data.error) { console.error('[Odoo] Error:', JSON.stringify(data.error)); throw new Error(data.error.message); }
   return data.result;
 }
 
-/** Find Odoo sale.order by Shopify order name (e.g. #1001) */
 async function findOdooOrder(shopifyOrderName) {
   const results = await odoo('sale.order', 'search_read',
     [[['client_order_ref', '=', shopifyOrderName]]],
     { fields: ['id', 'name', 'state', 'tag_ids'], limit: 1 }
   );
-  return results && results[0];
+  return results?.[0];
 }
 
-/** Get or create a tag ID in Odoo */
 async function getTagId(tagName) {
-  let results = await odoo('crm.tag', 'search_read',
-    [[['name', '=', tagName]]],
-    { fields: ['id'], limit: 1 }
-  );
-  if (results && results[0]) return results[0].id;
-  const id = await odoo('crm.tag', 'create', [{ name: tagName }]);
-  return id;
+  const results = await odoo('crm.tag', 'search_read', [[['name', '=', tagName]]], { fields: ['id'], limit: 1 });
+  if (results?.[0]) return results[0].id;
+  return await odoo('crm.tag', 'create', [{ name: tagName }]);
 }
 
-/** Add a tag to an Odoo sale order */
 async function addTagToOrder(odooOrderId, tagName) {
   const tagId = await getTagId(tagName);
-  await odoo('sale.order', 'write',
-    [[odooOrderId], { tag_ids: [[4, tagId]] }]
-  );
-  console.log(`[Odoo] Tagged order ${odooOrderId} with ${tagName}`);
+  await odoo('sale.order', 'write', [[odooOrderId], { tag_ids: [[4, tagId]] }]);
+  console.log(`[Odoo] Tagged order ${odooOrderId} with "${tagName}"`);
 }
 
-/** Cancel an Odoo sale order */
 async function cancelOdooOrder(odooOrderId) {
   await odoo('sale.order', 'action_cancel', [[odooOrderId]]);
   console.log(`[Odoo] Cancelled order ${odooOrderId}`);
 }
 
-/** Issue a Shopify refund for a card payment */
+// ─── Shopify helpers ──────────────────────────────────────────────────────────
+async function shopifyCancel(shopifyOrderId) {
+  const res = await fetch(
+    `https://${SHOPIFY_STORE_URL}/admin/api/2024-01/orders/${shopifyOrderId}/cancel.json`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN },
+      body: JSON.stringify({ reason: 'customer', email: false }),
+    }
+  );
+  const data = await res.json();
+  console.log('[Shopify] Cancel:', JSON.stringify(data).slice(0, 100));
+  return data;
+}
+
 async function shopifyRefund(shopifyOrderId, amount, currency) {
-  // First get transactions to find the payment gateway transaction
   const txRes = await fetch(
     `https://${SHOPIFY_STORE_URL}/admin/api/2024-01/orders/${shopifyOrderId}/transactions.json`,
     { headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN } }
@@ -199,192 +163,148 @@ async function shopifyRefund(shopifyOrderId, amount, currency) {
   const txData = await txRes.json();
   const saleTx = (txData.transactions || []).find(t => t.kind === 'sale' || t.kind === 'capture');
 
-  const refundPayload = {
-    refund: {
-      currency,
-      notify: true,
-      transactions: saleTx ? [{
-        parent_id: saleTx.id,
-        amount,
-        kind: 'refund',
-        gateway: saleTx.gateway,
-      }] : [],
-    },
-  };
-
   const res = await fetch(
     `https://${SHOPIFY_STORE_URL}/admin/api/2024-01/orders/${shopifyOrderId}/refunds.json`,
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
-      },
-      body: JSON.stringify(refundPayload),
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN },
+      body: JSON.stringify({
+        refund: {
+          currency,
+          notify: true,
+          transactions: saleTx ? [{ parent_id: saleTx.id, amount, kind: 'refund', gateway: saleTx.gateway }] : [],
+        },
+      }),
     }
   );
   const data = await res.json();
-  console.log('[Shopify] Refund response:', JSON.stringify(data));
+  console.log('[Shopify] Refund:', JSON.stringify(data).slice(0, 100));
   return data;
 }
 
-/** Cancel a Shopify order (for COD) */
-async function shopifyCancel(shopifyOrderId) {
-  const res = await fetch(
-    `https://${SHOPIFY_STORE_URL}/admin/api/2024-01/orders/${shopifyOrderId}/cancel.json`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
-      },
-      body: JSON.stringify({ reason: 'customer', email: false }),
-    }
-  );
-  const data = await res.json();
-  console.log('[Shopify] Cancel response:', JSON.stringify(data));
-  return data;
-}
-
-/** Normalise a phone number to E.164 (add country code if missing) */
+// ─── Phone normalisation ──────────────────────────────────────────────────────
 function normalisePhone(raw) {
   if (!raw) return null;
   let phone = raw.replace(/\D/g, '');
   if (phone.startsWith('0')) phone = '20' + phone.slice(1); // Egypt default
-  if (!phone.startsWith('+')) phone = '+' + phone;
-  return phone;
+  return phone; // digits only, no "+"
 }
 
 // ─── Shopify Webhook: Order Created ──────────────────────────────────────────
 app.post('/webhook/order-created', async (req, res) => {
-  res.sendStatus(200); // always ack immediately
+  res.sendStatus(200); // ack immediately
 
   try {
     const order = req.body;
     const shopifyOrderId = String(order.id);
-    const orderName = order.name; // e.g. #1001
+    const orderName = order.name;
     const total = order.total_price;
     const currency = order.currency;
     const phone = normalisePhone(
       order.billing_address?.phone || order.shipping_address?.phone || order.phone
     );
-    const paymentGateway = (order.payment_gateway_names || [])[0] || '';
-    const isCOD = paymentGateway.toLowerCase().includes('cod') ||
-                  paymentGateway.toLowerCase().includes('cash') ||
-                  order.payment_terms?.payment_terms_name?.toLowerCase().includes('cod');
+    const gateway = (order.payment_gateway_names || [])[0] || '';
+    const isCOD = /cod|cash/i.test(gateway) || /cod/i.test(order.payment_terms?.payment_terms_name || '');
 
-    console.log(`[Order] ${orderName} | ${phone} | gateway: ${paymentGateway} | COD: ${isCOD}`);
+    console.log(`[Order] ${orderName} | phone:${phone} | gateway:${gateway} | COD:${isCOD}`);
 
-    if (!phone) {
-      console.warn('[Order] No phone number found, skipping WhatsApp.');
-      return;
-    }
+    if (!phone) { console.warn('[Order] No phone, skipping.'); return; }
 
-    await sendWhatsApp(phone, msgConfirmation(orderName, isCOD ? 'cod' : 'card', total, currency));
+    await sendWhatsApp(phone, msgConfirmation(orderName, isCOD, total, currency));
 
-    // Save pending state
-    const noReplyTimer = setTimeout(async () => {
-      // After 2 hours of initial message — send retry
+    // Schedule retry after 2h → tag no-response after another 2h
+    const retryTimer = setTimeout(async () => {
       if (!pendingOrders[phone]) return;
       await sendWhatsApp(phone, msgRetry(orderName));
-      pendingOrders[phone].retried = true;
 
-      // After another 2 hours — tag as no-response
-      pendingOrders[phone].noReplyTimer2 = setTimeout(async () => {
+      pendingOrders[phone].noReplyTimer = setTimeout(async () => {
         if (!pendingOrders[phone]) return;
-        const entry = pendingOrders[phone];
         try {
           const odooOrder = await findOdooOrder(orderName);
           if (odooOrder) await addTagToOrder(odooOrder.id, 'wa-no-response');
         } catch (e) { console.error('[NoReply] Odoo error:', e.message); }
         delete pendingOrders[phone];
-        console.log(`[NoReply] Order ${orderName} tagged wa-no-response`);
       }, 2 * 60 * 60 * 1000);
-
     }, 2 * 60 * 60 * 1000);
 
-    pendingOrders[phone] = {
-      shopifyOrderId,
-      orderName,
-      isCOD,
-      total,
-      currency,
-      retried: false,
-      noReplyTimer,
-    };
+    pendingOrders[phone] = { shopifyOrderId, orderName, isCOD, total, currency, retryTimer };
 
   } catch (err) {
     console.error('[Order Webhook] Error:', err.message);
   }
 });
 
-// ─── UltraMsg Webhook: Customer Reply ────────────────────────────────────────
+// ─── Meta Webhook: Verification (GET) ────────────────────────────────────────
+app.get('/webhook/wa-reply', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    console.log('[Meta] Webhook verified');
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
+
+// ─── Meta Webhook: Incoming Message (POST) ───────────────────────────────────
 app.post('/webhook/wa-reply', async (req, res) => {
   res.sendStatus(200);
-
   try {
-    const { data } = req.body;
-    if (!data || data.from_me) return; // ignore outgoing messages
+    const entry = req.body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const msg = value?.messages?.[0];
+    if (!msg) return;
 
-    const from = '+' + String(data.from || '').replace(/\D/g, '');
-    const text = (data.body || '').trim();
+    const from = msg.from; // digits only, no "+"
+    const text = (msg.text?.body || '').trim();
+    console.log(`[WA Reply] from:${from} text:"${text}"`);
 
-    console.log(`[WA Reply] from: ${from}, text: "${text}"`);
-
-    const entry = pendingOrders[from];
-    if (!entry) {
-      console.log('[WA Reply] No pending order for', from);
-      return;
-    }
+    const pending = pendingOrders[from];
+    if (!pending) { console.log('[WA Reply] No pending order for', from); return; }
 
     // Clear timers
-    clearTimeout(entry.noReplyTimer);
-    clearTimeout(entry.noReplyTimer2);
+    clearTimeout(pending.retryTimer);
+    clearTimeout(pending.noReplyTimer);
 
     if (text === '1') {
-      // ── CONFIRMED ──────────────────────────────────────────────────────────
+      // CONFIRMED
       try {
-        const odooOrder = await findOdooOrder(entry.orderName);
+        const odooOrder = await findOdooOrder(pending.orderName);
         if (odooOrder) await addTagToOrder(odooOrder.id, 'wa-confirmed');
-      } catch (e) { console.error('[Confirm] Odoo error:', e.message); }
-      await sendWhatsApp(from, msgConfirmed(entry.orderName));
+      } catch (e) { console.error('[Confirm] Odoo:', e.message); }
+      await sendWhatsApp(from, msgConfirmed(pending.orderName));
       delete pendingOrders[from];
 
     } else if (text === '2') {
-      // ── CANCELLED ──────────────────────────────────────────────────────────
+      // CANCELLED
       try {
-        const odooOrder = await findOdooOrder(entry.orderName);
+        const odooOrder = await findOdooOrder(pending.orderName);
         if (odooOrder) {
           await cancelOdooOrder(odooOrder.id);
           await addTagToOrder(odooOrder.id, 'wa-cancelled');
         }
-      } catch (e) { console.error('[Cancel] Odoo error:', e.message); }
+      } catch (e) { console.error('[Cancel] Odoo:', e.message); }
 
-      if (entry.isCOD) {
-        // COD: cancel Shopify order (Odoo connector will sync too)
-        try { await shopifyCancel(entry.shopifyOrderId); } catch (e) { console.error('[Cancel COD] Shopify error:', e.message); }
-        await sendWhatsApp(from, msgCancelledCOD(entry.orderName));
+      if (pending.isCOD) {
+        try { await shopifyCancel(pending.shopifyOrderId); } catch (e) { console.error('[Cancel COD]', e.message); }
+        await sendWhatsApp(from, msgCancelledCOD(pending.orderName));
       } else {
-        // Card: refund via Shopify
-        try { await shopifyRefund(entry.shopifyOrderId, entry.total, entry.currency); } catch (e) { console.error('[Cancel Card] Refund error:', e.message); }
-        await sendWhatsApp(from, msgCancelledCard(entry.orderName, entry.total, entry.currency));
+        try { await shopifyRefund(pending.shopifyOrderId, pending.total, pending.currency); } catch (e) { console.error('[Refund]', e.message); }
+        await sendWhatsApp(from, msgCancelledCard(pending.orderName, pending.total, pending.currency));
       }
       delete pendingOrders[from];
 
     } else {
-      console.log('[WA Reply] Unrecognised reply, ignoring.');
+      console.log('[WA Reply] Unrecognised reply:', text);
     }
-
   } catch (err) {
     console.error('[WA Reply Webhook] Error:', err.message);
   }
 });
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'running', time: new Date().toISOString() });
-});
+app.get('/', (req, res) => res.json({ status: 'running', time: new Date().toISOString() }));
 
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
