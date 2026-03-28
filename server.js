@@ -304,6 +304,28 @@ app.post('/webhook/wa-reply', async (req, res) => {
   }
 });
 
+// ─── Shopify OAuth Callback (one-time token capture) ─────────────────────────
+app.get('/oauth/callback', async (req, res) => {
+  const { code, shop } = req.query;
+  if (!code || !shop) return res.status(400).send('Missing code or shop');
+  try {
+    const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: process.env.SHOPIFY_CLIENT_ID,
+        client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+        code,
+      }),
+    });
+    const data = await tokenRes.json();
+    console.log('🔑 SHOPIFY TOKEN CAPTURED:', JSON.stringify(data));
+    res.send(`<h1>✅ Token captured!</h1><pre>${JSON.stringify(data, null, 2)}</pre>`);
+  } catch (e) {
+    res.status(500).send('Error: ' + e.message);
+  }
+});
+
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'running', time: new Date().toISOString() }));
 
