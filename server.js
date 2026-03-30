@@ -4,8 +4,9 @@ const crypto  = require('crypto');
 
 // ─── Environment Variables ────────────────────────────────────────────────────
 const {
-  ULTRAMSG_INSTANCE_ID,
-  ULTRAMSG_TOKEN,
+  META_PHONE_NUMBER_ID,   // e.g. 1091672370692388
+  META_ACCESS_TOKEN,      // from Meta developer console "Generate access token"
+  META_VERIFY_TOKEN,      // any secret string you choose for webhook verification
   SHOPIFY_STORE_URL,
   SHOPIFY_ADMIN_TOKEN,
   SHOPIFY_WEBHOOK_SECRET,
@@ -41,19 +42,26 @@ function normalisePhone(raw) {
   return digits;
 }
 
-// ─── UltraMsg: Send WhatsApp ──────────────────────────────────────────────────
+// ─── Meta Cloud API: Send WhatsApp ───────────────────────────────────────────
 async function sendWhatsApp(phone, message) {
   const digits = normalisePhone(phone);
-  const to = '+' + digits;
-  const url = `https://api.ultramsg.com/${ULTRAMSG_INSTANCE_ID}/messages/chat`;
-  const params = new URLSearchParams({ token: ULTRAMSG_TOKEN, to, body: message, priority: 1 });
+  const url = `https://graph.facebook.com/v22.0/${META_PHONE_NUMBER_ID}/messages`;
+  const body = {
+    messaging_product: 'whatsapp',
+    to: digits,
+    type: 'text',
+    text: { body: message },
+  };
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
+    headers: {
+      'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
   });
   const data = await res.json();
-  console.log('[WA] Sent to', to, '->', JSON.stringify(data));
+  console.log('[WA] Sent to', digits, '->', JSON.stringify(data));
   return data;
 }
 
@@ -214,18 +222,39 @@ app.post('/webhook/order-created', async (req, res) => {
   } catch (err) { console.error('[Order Webhook] Error:', err); }
 });
 
-// ─── UltraMsg Webhook: Incoming Reply ────────────────────────────────────────
+// ─── Meta Webhook GET: Verification Challenge ─────────────────────────────────
+app.get('/webhook/wa-reply', (req, res) => {
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  console.log(`[Meta Verify] mode:${mode} token:${token}`);
+  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    console.log('[Meta Verify] ✅ Webhook verified');
+    res.status(200).send(challenge);
+  } else {
+    console.warn('[Meta Verify] ❌ Token mismatch');
+    res.sendStatus(403);
+  }
+});
+
+// ─── Meta Webhook POST: Incoming WhatsApp Messages ───────────────────────────
 app.post('/webhook/wa-reply', async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // always 200 immediately
 
   try {
-    const body = req.body;
-    if (!body || body.event_type !== 'message_received') return;
-    const msg = body.data;
-    if (!msg || msg.type !== 'chat') return;
+    const body    = req.body;
+    const entry   = body?.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value   = changes?.value;
 
-    const from = normalisePhone((msg.from || '').replace(/@c\.us$/, ''));
-    const text = (msg.body || '').trim();
+    // ignore status updates (delivery receipts, read receipts)
+    if (!value || !value.messages) return;
+
+    const msg = value.messages[0];
+    if (!msg || msg.type !== 'text') return;
+
+    const from = normalisePhone(msg.from);
+    const text = msg.text?.body?.trim();
     console.log(`[WA Reply] from:${from} text:"${text}"`);
 
     if (!from || !pendingOrders.has(from)) {
@@ -236,6 +265,7 @@ app.post('/webhook/wa-reply', async (req, res) => {
     if (state.confirmed) return;
 
     if (text === '1') {
+      // ── Confirmed ────────────────────────────────────────────────────────
       clearOrderTimers(from);
       state.confirmed = true;
       pendingOrders.set(from, state);
@@ -246,6 +276,7 @@ app.post('/webhook/wa-reply', async (req, res) => {
       console.log(`[Confirm] ${state.orderName} confirmed`);
 
     } else if (text === '2') {
+      // ── Cancelled ────────────────────────────────────────────────────────
       clearOrderTimers(from);
       pendingOrders.delete(from);
       const cod = isCod(state.paymentGateway);
@@ -272,10 +303,17 @@ app.post('/webhook/wa-reply', async (req, res) => {
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'running', time: new Date().toISOString(), pending: pendingOrders.size });
+  res.json({
+    status: 'running',
+    time: new Date().toISOString(),
+    pending: pendingOrders.size,
+    phoneNumberId: META_PHONE_NUMBER_ID || 'NOT SET',
+    store: SHOPIFY_STORE_URL || 'NOT SET',
+    odoo: ODOO_URL || 'NOT SET',
+  });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`[Server] Port ${PORT} | UltraMsg:${ULTRAMSG_INSTANCE_ID || 'NOT SET'} | Store:${SHOPIFY_STORE_URL || 'NOT SET'} | Odoo:${ODOO_URL || 'NOT SET'}`);
+  console.log(`[Server] Port ${PORT} | PhoneNumberID:${META_PHONE_NUMBER_ID || 'NOT SET'} | Store:${SHOPIFY_STORE_URL || 'NOT SET'} | Odoo:${ODOO_URL || 'NOT SET'}`);
 });
