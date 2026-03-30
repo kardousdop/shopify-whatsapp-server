@@ -282,14 +282,23 @@ app.post('/webhook/wa-reply', async (req, res) => {
       const cod = isCod(state.paymentGateway);
       console.log(`[Cancel] ${state.orderName} | COD:${cod}`);
 
+      // Cancel in Odoo — Odoo's Shopify integration will sync the cancellation
+      // to Shopify automatically. For card payments, Shopify refund must be
+      // triggered manually by the team since refunds require payment gateway action.
+      const odooOrder = await findOdooOrder(state.orderId).catch(() => null);
+      if (odooOrder) {
+        await cancelOdooOrder(odooOrder.id);
+        console.log(`[Cancel] Odoo order ${odooOrder.id} cancelled — Shopify sync via Odoo integration`);
+      } else {
+        // Odoo not configured or order not found — fall back to direct Shopify cancel
+        console.log(`[Cancel] Odoo not available, cancelling Shopify directly`);
+        await cancelShopifyOrder(state.orderId, cod ? false : true);
+      }
+
       if (cod) {
-        await cancelShopifyOrder(state.orderId, false);
-        const odooOrder = await findOdooOrder(state.orderId).catch(() => null);
-        if (odooOrder) await cancelOdooOrder(odooOrder.id);
         await sendWhatsApp(from,
           `❌ تم إلغاء طلبك ${state.orderName}.\nيمكنك الطلب مجدداً في أي وقت 🛍️`);
       } else {
-        await cancelShopifyOrder(state.orderId, true);
         await sendWhatsApp(from,
           `❌ تم إلغاء طلبك ${state.orderName} وسيتم رد المبلغ خلال 3-5 أيام عمل 💳`);
       }
