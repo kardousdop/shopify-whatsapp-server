@@ -21,11 +21,11 @@ const app = express();
 
 // ─── Body Parsing (raw for HMAC verification) ─────────────────────────────────
 app.use((req, res, next) => {
-  let data = '';
-  req.on('data', chunk => { data += chunk; });
+  const chunks = [];
+  req.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
   req.on('end', () => {
-    req.rawBody = data;
-    try { req.body = JSON.parse(data); } catch { req.body = {}; }
+    req.rawBody = Buffer.concat(chunks);          // keep as Buffer for exact-byte HMAC
+    try { req.body = JSON.parse(req.rawBody.toString('utf8')); } catch { req.body = {}; }
     next();
   });
 });
@@ -171,13 +171,22 @@ async function handleNoResponse(phone, orderId, orderName) {
 // ─── Verify Shopify HMAC ──────────────────────────────────────────────────────
 function verifyShopifyHmac(req) {
   if (!SHOPIFY_WEBHOOK_SECRET || SHOPIFY_WEBHOOK_SECRET === 'PLACEHOLDER') return true;
-  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-  if (!hmacHeader) return false;
+  const hmacHeader = (req.headers['x-shopify-hmac-sha256'] || '').trim();
+  if (!hmacHeader) { console.warn('[HMAC] No header present'); return false; }
   const digest = crypto.createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
-    .update(req.rawBody, 'utf8').digest('base64');
+    .update(req.rawBody)           // rawBody is a Buffer — no encoding arg needed
+    .digest('base64');
+  console.log('[HMAC] header:', hmacHeader.substring(0,12) + '...  digest:', digest.substring(0,12) + '...');
   try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
-  } catch { return false; }
+    return crypto.timingSafeEqual(
+      Buffer.from(digest,    'utf8'),
+      Buffer.from(hmacHeader,'utf8'),
+    );
+  } catch (e) {
+    console.warn('[HMAC] timingSafeEqual error:', e.message,
+      '| digest len:', digest.length, 'header len:', hmacHeader.length);
+    return false;
+  }
 }
 
 // ─── Shopify Webhook: Order Created ──────────────────────────────────────────
