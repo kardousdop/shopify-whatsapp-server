@@ -436,4 +436,40 @@ app.post('/webhook/shopify', async (req, res) => {
   }
 });
 
+// ─── Temp: Manual Odoo Cancel Test ───────────────────────────────────────────
+app.get('/admin/cancel-odoo/:odooId', async (req, res) => {
+  const odooId = parseInt(req.params.odooId);
+  const results = [];
+  try {
+    const uid = await odooAuthenticate();
+    results.push(`Authenticated uid: ${uid}`);
+
+    const records = await odooCall('/xmlrpc/2/object', 'execute_kw', [
+      ODOO_DB, uid, ODOO_PASSWORD, 'sale.order', 'read',
+      [[odooId], ['id','name','state','client_order_ref']]]);
+    results.push(`Order: ${JSON.stringify(records[0])}`);
+
+    try {
+      await odooCall('/xmlrpc/2/object', 'execute_kw', [
+        ODOO_DB, uid, ODOO_PASSWORD, 'sale.order', 'action_unlock', [[odooId]], {}]);
+      results.push('Unlock: OK');
+    } catch(e) { results.push(`Unlock skipped: ${e.message}`); }
+
+    await odooCall('/xmlrpc/2/object', 'execute_kw', [
+      ODOO_DB, uid, ODOO_PASSWORD, 'sale.order', 'action_cancel', [[odooId]]]);
+    results.push('Cancel in Odoo: OK');
+
+    const methods = ['action_cancel_in_shopify','shopify_cancel_order','cancel_in_shopify','action_shopify_cancel'];
+    for (const m of methods) {
+      try {
+        await odooCall('/xmlrpc/2/object', 'execute_kw', [
+          ODOO_DB, uid, ODOO_PASSWORD, 'sale.order', m, [[odooId]], {}]);
+        results.push(`Cancel In Shopify: SUCCESS via ${m}`);
+        break;
+      } catch(e) { results.push(`${m}: ${e.message}`); }
+    }
+  } catch(e) { results.push(`ERROR: ${e.message}`); }
+  res.send('<pre>' + results.join('\n') + '</pre>');
+});
+
 app.listen(PORT, () => console.log(`✅ Server listening on port ${PORT}`));
