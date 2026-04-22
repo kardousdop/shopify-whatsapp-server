@@ -144,16 +144,27 @@ async function odooAuthenticate() {
 
 async function findOdooOrder(shopifyOrderName) {
   const uid = await odooAuthenticate();
-  // Shopify connector stores the order ref in client_order_ref (e.g. "#53124")
-  // Try both with and without the # prefix
   const nameClean = String(shopifyOrderName).replace(/^#/, '');
-  const ids = await odooCall('/xmlrpc/2/object', 'execute_kw', [
+  const variants = [shopifyOrderName, nameClean, `#${nameClean}`];
+
+  // Search by name first (some connectors use Shopify # as the Odoo order name)
+  const byName = await odooCall('/xmlrpc/2/object', 'execute_kw', [
     ODOO_DB, uid, ODOO_PASSWORD,
     'sale.order', 'search',
-    [[['client_order_ref', 'in', [shopifyOrderName, nameClean, `#${nameClean}`]]]],
+    [[['name', 'in', variants]]],
   ]);
+
+  // Also search by client_order_ref (standard Shopify connector field)
+  const byRef = await odooCall('/xmlrpc/2/object', 'execute_kw', [
+    ODOO_DB, uid, ODOO_PASSWORD,
+    'sale.order', 'search',
+    [[['client_order_ref', 'in', variants]]],
+  ]);
+
+  const ids = [...new Set([...(byName || []), ...(byRef || [])])];
+
   if (!ids || ids.length === 0) {
-    console.warn(`Odoo order not found for shopify ref "${shopifyOrderName}" — tried client_order_ref`);
+    console.warn(`Odoo order not found for "${shopifyOrderName}" — tried name + client_order_ref`);
     return null;
   }
   const records = await odooCall('/xmlrpc/2/object', 'execute_kw', [
@@ -182,6 +193,28 @@ async function cancelOdooOrder(odooId) {
     [[odooId]],
   ]);
   console.log(`Cancelled Odoo order ID ${odooId}`);
+
+  // Trigger "Cancel In Shopify" button — syncs cancellation back to Shopify
+  const cancelMethods = [
+    'action_cancel_in_shopify',
+    'shopify_cancel_order',
+    'cancel_in_shopify',
+    'action_shopify_cancel',
+  ];
+  let shopifySyncDone = false;
+  for (const method of cancelMethods) {
+    try {
+      await odooCall('/xmlrpc/2/object', 'execute_kw', [
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order', method, [[odooId]], {}]);
+      console.log(`Cancel In Shopify triggered via method: ${method}`);
+      shopifySyncDone = true;
+      break;
+    } catch (e) {
+      console.log(`Method ${method} not found, trying next...`);
+    }
+  }
+  if (!shopifySyncDone) console.warn(`Could not find Cancel In Shopify method — may need manual sync`);
 }
 
 app.get('/webhook/meta', (req, res) => {
@@ -232,8 +265,8 @@ app.post('/webhook/meta', async (req, res) => {
           type: 'text',
           text: { body: `❌ تم إلغاء طلبك ${order.orderNumber}.\nيمكنك الطلب مجدداً في أي وقت 🛍️` },
         });
-        // Cancel in Odoo — retry every 2 min for up to 20 min (order may not be synced yet)
-        cancelInOdooWithRetry(order.orderNumber, 10, 2 * 60 * 1000);
+        // Cancel in Odoo — retry every 3 min for up to 60 min (Shopify→Odoo sync can take 45 min)
+        cancelInOdooWithRetry(order.orderNumber, 20, 3 * 60 * 1000);
         pendingOrders.delete(from);
       } else {
         // Unknown reply — remind the customer
