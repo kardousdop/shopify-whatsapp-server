@@ -251,6 +251,89 @@ app.post('/webhook/meta', async (req, res) => {
   }
 });
 
+// ─── Abandoned Cart ───────────────────────────────────────────────────────────
+const pendingCheckouts = new Map(); // token → { phone, timer }
+
+app.post('/webhook/checkout', async (req, res) => {
+  if (!verifyShopifyHmac(req)) return res.sendStatus(401);
+  res.sendStatus(200);
+  try {
+    const checkout = req.body;
+    if (!checkout || !checkout.token) return;
+    if (checkout.completed_at) return; // already completed, ignore
+
+    const phone = normalizePhone(
+      checkout.shipping_address?.phone ||
+      checkout.billing_address?.phone ||
+      checkout.phone || checkout.email || ''
+    );
+    if (!phone || phone.length < 10) {
+      console.log(`Checkout ${checkout.token} — no phone yet, skipping`);
+      return;
+    }
+
+    const token          = checkout.token;
+    const checkoutUrl    = checkout.abandoned_checkout_url;
+    const lineItems      = checkout.line_items || [];
+    const firstItem      = lineItems[0] || {};
+    const productTitle   = lineItems.map(i => i.title).join(', ') || 'منتجاتك';
+    const productImage   = firstItem.image_url || null;
+    const totalPrice     = checkout.total_price || '0';
+    const currency       = checkout.currency || 'EGP';
+
+    // Reset timer if checkout was already tracked
+    if (pendingCheckouts.has(token)) {
+      clearTimeout(pendingCheckouts.get(token).timer);
+    }
+
+    const timer = setTimeout(async () => {
+      pendingCheckouts.delete(token);
+      try {
+        // Verify the checkout is still incomplete
+        const data = await shopifyFetch(`checkouts/${token}.json`);
+        if (data?.checkout?.completed_at) {
+          console.log(`Checkout ${token} completed — no reminder needed`);
+          return;
+        }
+        console.log(`Sending abandoned cart reminder to ${phone} for checkout ${token}`);
+
+        // Send product image first if available
+        if (productImage) {
+          await waFetch(`${META_PHONE_NUMBER_ID}/messages`, {
+            messaging_product: 'whatsapp',
+            to: phone,
+            type: 'image',
+            image: { link: productImage, caption: productTitle },
+          });
+        }
+
+        // Send reminder text with checkout link
+        const msg =
+          `مرحباً! 👋 نسيت شيئاً في سلتك 🛒\n\n` +
+          `🛍️ ${productTitle}\n` +
+          `💰 الإجمالي: ${totalPrice} ${currency}\n\n` +
+          `أكمل طلبك الآن 👇\n${checkoutUrl}`;
+
+        await waFetch(`${META_PHONE_NUMBER_ID}/messages`, {
+          messaging_product: 'whatsapp',
+          to: phone,
+          type: 'text',
+          text: { body: msg },
+        });
+        console.log(`Abandoned cart reminder sent to ${phone}`);
+      } catch (e) {
+        console.error('Abandoned cart send error:', e.message);
+      }
+    }, 15 * 60 * 1000); // 15 minutes
+
+    pendingCheckouts.set(token, { phone, timer });
+    console.log(`Abandoned cart timer set — phone:${phone} checkout:${token}`);
+  } catch (e) {
+    console.error('Checkout webhook error:', e.message);
+  }
+});
+
+// ─── Shopify Order Webhook ────────────────────────────────────────────────────
 app.post('/webhook/shopify', async (req, res) => {
   if (!verifyShopifyHmac(req)) {
     console.warn('HMAC verification failed — blocking request');
