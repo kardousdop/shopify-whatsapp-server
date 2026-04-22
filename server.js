@@ -232,14 +232,8 @@ app.post('/webhook/meta', async (req, res) => {
           type: 'text',
           text: { body: `❌ تم إلغاء طلبك ${order.orderNumber}.\nيمكنك الطلب مجدداً في أي وقت 🛍️` },
         });
-        // Cancel in Odoo (unlock first, then cancel) — Odoo connector syncs to Shopify automatically
-        try {
-          const odooOrder = await findOdooOrder(order.orderNumber);
-          if (odooOrder) await cancelOdooOrder(odooOrder.id);
-          else console.warn(`Odoo order not found for ${order.orderNumber}`);
-        } catch (e) {
-          console.error('Odoo cancel error:', e.message);
-        }
+        // Cancel in Odoo — retry every 2 min for up to 20 min (order may not be synced yet)
+        cancelInOdooWithRetry(order.orderNumber, 10, 2 * 60 * 1000);
         pendingOrders.delete(from);
       } else {
         // Unknown reply — remind the customer
@@ -255,6 +249,29 @@ app.post('/webhook/meta', async (req, res) => {
     console.error('Meta webhook error:', e.message);
   }
 });
+
+// ─── Odoo Cancel with Retry ──────────────────────────────────────────────────
+// Shopify→Odoo sync takes 10-15 min, so retry until the order appears in Odoo
+async function cancelInOdooWithRetry(orderNumber, retriesLeft, intervalMs) {
+  try {
+    const odooOrder = await findOdooOrder(orderNumber);
+    if (odooOrder) {
+      console.log(`Odoo order found for ${orderNumber} — cancelling now`);
+      await cancelOdooOrder(odooOrder.id);
+      return;
+    }
+  } catch (e) {
+    console.error(`Odoo cancel attempt error for ${orderNumber}:`, e.message);
+  }
+
+  if (retriesLeft <= 0) {
+    console.warn(`Odoo cancel gave up for ${orderNumber} after all retries`);
+    return;
+  }
+
+  console.log(`Odoo order not found yet for ${orderNumber} — retrying in ${intervalMs / 60000} min (${retriesLeft} retries left)`);
+  setTimeout(() => cancelInOdooWithRetry(orderNumber, retriesLeft - 1, intervalMs), intervalMs);
+}
 
 // ─── Abandoned Cart ───────────────────────────────────────────────────────────
 const pendingCheckouts = new Map(); // token → { phone, timer }
