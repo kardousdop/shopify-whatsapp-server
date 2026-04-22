@@ -101,22 +101,34 @@ async function tagShopifyOrder(orderId, newTag) {
 }
 
 // ─── Odoo JSON-RPC ────────────────────────────────────────────────────────────
-let odooSessionUid = null;
-let odooSessionDb  = null;
+let odooSessionUid    = null;
+let odooSessionDb     = null;
+let odooSessionCookie = null;  // session_id cookie required for call_kw
 
-async function odooRpc(endpoint, params) {
+async function odooRpc(endpoint, params, cookie = null) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (cookie) headers['Cookie'] = cookie;
+
   const r = await fetch(`${ODOO_URL}${endpoint}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ jsonrpc: '2.0', method: 'call', id: 1, params }),
   });
+
+  // Capture session cookie from auth response
+  const setCookie = r.headers.get('set-cookie');
+  if (setCookie) {
+    const match = setCookie.match(/session_id=[^;]+/);
+    if (match) odooSessionCookie = match[0];
+  }
+
   const d = await r.json();
   if (d.error) throw new Error(JSON.stringify(d.error));
   return d.result;
 }
 
 async function odooEnsureSession() {
-  if (odooSessionUid) return;
+  if (odooSessionUid && odooSessionCookie) return;
 
   // Auto-discover DB name (Odoo Online uses a different internal name)
   let db = ODOO_DB;
@@ -124,7 +136,6 @@ async function odooEnsureSession() {
     const dbs = await odooRpc('/web/database/list', {});
     if (Array.isArray(dbs) && dbs.length > 0) {
       console.log('[Odoo] Available DBs:', dbs);
-      // Use configured DB if it exists, otherwise fall back to first
       db = dbs.includes(ODOO_DB) ? ODOO_DB : dbs[0];
       console.log('[Odoo] Using DB:', db);
     }
@@ -138,14 +149,24 @@ async function odooEnsureSession() {
   if (!session?.uid) throw new Error(`Odoo auth failed — db:${db} user:${ODOO_USERNAME}`);
   odooSessionUid = session.uid;
   odooSessionDb  = session.db || db;
-  console.log(`[Odoo] Authenticated — uid:${odooSessionUid} db:${odooSessionDb}`);
+  console.log(`[Odoo] Authenticated — uid:${odooSessionUid} db:${odooSessionDb} cookie:${odooSessionCookie}`);
 }
 
 async function odooCallKw(model, method, args, kwargs = {}) {
   await odooEnsureSession();
-  return odooRpc('/web/dataset/call_kw', {
-    model, method, args, kwargs,
-  });
+  try {
+    return await odooRpc('/web/dataset/call_kw', { model, method, args, kwargs }, odooSessionCookie);
+  } catch (e) {
+    // Session expired — re-authenticate once and retry
+    if (e.message.includes('SessionExpired') || e.message.includes('Session expired')) {
+      console.warn('[Odoo] Session expired — re-authenticating...');
+      odooSessionUid = null;
+      odooSessionCookie = null;
+      await odooEnsureSession();
+      return await odooRpc('/web/dataset/call_kw', { model, method, args, kwargs }, odooSessionCookie);
+    }
+    throw e;
+  }
 }
 
 async function findOdooOrder(shopifyOrderName) {
@@ -387,32 +408,33 @@ app.get('/admin/cancel-odoo/:odooId', async (req, res) => {
     const session = await odooRpc('/web/session/authenticate', {
       db, login: ODOO_USERNAME, password: ODOO_PASSWORD,
     });
-    results.push(`Auth: uid=${session?.uid} db=${session?.db}`);
+    results.push(`Auth: uid=${session?.uid} db=${session?.db} cookie:${odooSessionCookie}`);
     if (!session?.uid) { res.send('<pre>' + results.join('\n') + '</pre>'); return; }
 
     // Cache session for reuse
     odooSessionUid = session.uid;
     odooSessionDb  = session.db || db;
+    const cookie   = odooSessionCookie;
 
     // Read order
     const records = await odooRpc('/web/dataset/call_kw', {
       model: 'sale.order', method: 'read',
       args: [[odooId], ['id', 'name', 'state', 'client_order_ref']], kwargs: {},
-    });
+    }, cookie);
     results.push(`Order: ${JSON.stringify(records?.[0])}`);
 
     // Unlock
     try {
       await odooRpc('/web/dataset/call_kw', {
         model: 'sale.order', method: 'action_unlock', args: [[odooId]], kwargs: {},
-      });
+      }, cookie);
       results.push('Unlock: OK');
     } catch (e) { results.push(`Unlock skipped: ${e.message}`); }
 
     // Cancel
     await odooRpc('/web/dataset/call_kw', {
       model: 'sale.order', method: 'action_cancel', args: [[odooId]], kwargs: {},
-    });
+    }, cookie);
     results.push('Cancel in Odoo: OK ✅');
 
     // Try Cancel-In-Shopify methods
@@ -421,7 +443,7 @@ app.get('/admin/cancel-odoo/:odooId', async (req, res) => {
       try {
         await odooRpc('/web/dataset/call_kw', {
           model: 'sale.order', method: m, args: [[odooId]], kwargs: {},
-        });
+        }, cookie);
         results.push(`Cancel In Shopify: ✅ via ${m}`);
         break;
       } catch (e) { results.push(`${m}: ❌ ${e.message.slice(0, 80)}`); }
