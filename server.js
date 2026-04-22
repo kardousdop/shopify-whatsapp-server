@@ -148,6 +148,15 @@ async function findOdooOrder(shopifyOrderName) {
 
 async function cancelOdooOrder(odooId) {
   const uid = await odooAuthenticate();
+  // Unlock first (required if order is in confirmed/locked state in Odoo)
+  try {
+    await odooCall('/xmlrpc/2/object', 'execute_kw', [
+      ODOO_DB, uid, ODOO_PASSWORD,
+      'sale.order', 'action_unlock', [[odooId]], {}]);
+    console.log(`Unlocked Odoo order ID ${odooId}`);
+  } catch (e) {
+    console.log(`Odoo unlock skipped: ${e.message}`);
+  }
   await odooCall('/xmlrpc/2/object', 'execute_kw', [
     ODOO_DB, uid, ODOO_PASSWORD,
     'sale.order', 'action_cancel',
@@ -169,20 +178,41 @@ app.post('/webhook/meta', async (req, res) => {
   try {
     const messages = req.body?.entry?.[0]?.changes?.[0]?.value?.messages;
     for (const msg of messages || []) {
+      if (msg.type !== 'text') continue;
       const from = msg.from;
       const text = (msg.text?.body || '').trim();
+      console.log(`WA reply from ${from}: "${text}"`);
       const order = pendingOrders.get(from);
-      if (!order || order.status !== 'pending') continue;
+      if (!order) {
+        console.warn(`No pending order found for ${from} — server may have restarted`);
+        continue;
+      }
+      if (order.status !== 'pending') {
+        console.log(`Order ${order.orderNumber} already ${order.status}, ignoring reply`);
+        continue;
+      }
       const isConfirm = /^(1|yes|ok|نعم|تأكيد|اوكي|موافق|confirm)$/i.test(text);
       const isCancel  = /^(2|no|لا|إلغاء|الغاء|كنسل|cancel)$/i.test(text);
       if (isConfirm) {
         order.status = 'confirmed';
         console.log(`Order ${order.orderNumber} CONFIRMED by ${from}`);
         await tagShopifyOrder(order.shopifyOrderId, 'COD-Confirmed');
+        await waFetch(`${META_PHONE_NUMBER_ID}/messages`, {
+          messaging_product: 'whatsapp',
+          to: from,
+          type: 'text',
+          text: { body: `✅ تم تأكيد طلبك ${order.orderNumber} بنجاح!\nشكراً لك، سيتم شحن طلبك قريباً 🎉` },
+        });
       } else if (isCancel) {
         order.status = 'cancelled';
         console.log(`Order ${order.orderNumber} CANCELLED by ${from}`);
         await tagShopifyOrder(order.shopifyOrderId, 'COD-Cancelled');
+        await waFetch(`${META_PHONE_NUMBER_ID}/messages`, {
+          messaging_product: 'whatsapp',
+          to: from,
+          type: 'text',
+          text: { body: `❌ تم إلغاء طلبك ${order.orderNumber}.\nيمكنك الطلب مجدداً في أي وقت 🛍️` },
+        });
         try {
           const odooOrder = await findOdooOrder(order.orderNumber);
           if (odooOrder) await cancelOdooOrder(odooOrder.id);
@@ -191,6 +221,14 @@ app.post('/webhook/meta', async (req, res) => {
           console.error('Odoo cancel error:', e.message);
         }
         pendingOrders.delete(from);
+      } else {
+        // Unknown reply — remind the customer
+        await waFetch(`${META_PHONE_NUMBER_ID}/messages`, {
+          messaging_product: 'whatsapp',
+          to: from,
+          type: 'text',
+          text: { body: `للتأكيد اضغط *1*\nللإلغاء اضغط *2*` },
+        });
       }
     }
   } catch (e) {
