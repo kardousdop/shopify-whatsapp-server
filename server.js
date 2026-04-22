@@ -62,6 +62,18 @@ async function shopifyFetch(path, opts = {}) {
   return res.json();
 }
 
+async function cancelShopifyOrder(orderId) {
+  try {
+    const result = await shopifyFetch(`orders/${orderId}/cancel.json`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'customer' }),
+    });
+    console.log(`Shopify order ${orderId} cancel result:`, JSON.stringify(result?.order?.cancel_reason || result?.errors || 'done'));
+  } catch (e) {
+    console.error(`Shopify cancel error for order ${orderId}:`, e.message);
+  }
+}
+
 function verifyShopifyHmac(req) {
   const hmac = req.headers['x-shopify-hmac-sha256'];
   const rawLen = req.rawBody ? req.rawBody.length : 0;
@@ -213,6 +225,9 @@ app.post('/webhook/meta', async (req, res) => {
           type: 'text',
           text: { body: `❌ تم إلغاء طلبك ${order.orderNumber}.\nيمكنك الطلب مجدداً في أي وقت 🛍️` },
         });
+        // Cancel in Shopify directly
+        await cancelShopifyOrder(order.shopifyOrderId);
+        // Cancel in Odoo (unlock first, then cancel)
         try {
           const odooOrder = await findOdooOrder(order.orderNumber);
           if (odooOrder) await cancelOdooOrder(odooOrder.id);
