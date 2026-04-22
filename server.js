@@ -80,22 +80,20 @@ function verifyShopifyHmac(req) {
 }
 
 async function sendConfirmationTemplate(to, firstName, orderNumber, totalPrice) {
+  const message =
+    `مرحباً ${firstName || 'عزيزي العميل'} 👋\n` +
+    `شكراً لطلبك من myMayz!\n\n` +
+    `📦 رقم الطلب: ${orderNumber}\n` +
+    `💰 المبلغ: ${totalPrice} EGP\n\n` +
+    `لتأكيد طلبك اضغط *1*\n` +
+    `لإلغاء طلبك اضغط *2*\n\n` +
+    `سيتم تأكيد طلبك تلقائياً بعد 4 ساعات إذا لم تستجب.`;
+
   return waFetch(`${META_PHONE_NUMBER_ID}/messages`, {
     messaging_product: 'whatsapp',
     to,
-    type: 'template',
-    template: {
-      name: TEMPLATE_NAME,
-      language: { code: TEMPLATE_LANG },
-      components: [{
-        type: 'body',
-        parameters: [
-          { type: 'text', text: firstName || 'عزيزي العميل' },
-          { type: 'text', text: String(orderNumber) },
-          { type: 'text', text: String(totalPrice) },
-        ],
-      }],
-    },
+    type: 'text',
+    text: { body: message },
   });
 }
 
