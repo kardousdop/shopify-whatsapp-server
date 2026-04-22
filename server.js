@@ -208,12 +208,20 @@ app.post('/webhook/shopify', async (req, res) => {
   res.sendStatus(200);
   try {
     const order = req.body;
-    console.log('Shopify webhook received, order:', order.name, 'gateway:', order.payment_gateway || order.gateway);
+    // Collect all gateway info — Shopify may use payment_gateway, gateway, or payment_gateway_names
     const gateway = (order.payment_gateway || order.gateway || '').toLowerCase();
-    const isCOD = ['cash_on_delivery', 'cod', 'manual'].some(g => gateway.includes(g));
-    if (!isCOD) {
-      console.log('Not a COD order, skipping. Gateway:', gateway);
+    const gatewayNames = (Array.isArray(order.payment_gateway_names) ? order.payment_gateway_names : []).join(',').toLowerCase();
+    const allGateways = (gateway + ',' + gatewayNames).toLowerCase();
+    console.log('Shopify webhook received, order:', order.name, '| gateway:', gateway, '| names:', gatewayNames);
+    const isCOD = ['cash_on_delivery', 'cod', 'manual', 'cash'].some(g => allGateways.includes(g));
+    if (!isCOD && allGateways.replace(/,/g, '').trim() !== '') {
+      // Only skip if we actually know the gateway and it's not COD
+      console.log('Not a COD order, skipping. allGateways:', allGateways);
       return;
+    }
+    // If gateway is completely empty (undefined from Shopify), treat as COD since this store is COD-only
+    if (!isCOD && allGateways.replace(/,/g, '').trim() === '') {
+      console.log('Gateway unknown (empty) — treating as COD order for', order.name);
     }
     const addr = order.shipping_address || order.billing_address || {};
     const phone = normalizePhone(addr.phone || order.phone || '');
