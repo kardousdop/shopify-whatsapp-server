@@ -144,17 +144,24 @@ async function odooAuthenticate() {
 
 async function findOdooOrder(shopifyOrderName) {
   const uid = await odooAuthenticate();
+  // Shopify connector stores the order ref in client_order_ref (e.g. "#53124")
+  // Try both with and without the # prefix
+  const nameClean = String(shopifyOrderName).replace(/^#/, '');
   const ids = await odooCall('/xmlrpc/2/object', 'execute_kw', [
     ODOO_DB, uid, ODOO_PASSWORD,
     'sale.order', 'search',
-    [[['name', '=', shopifyOrderName]]],
+    [[['client_order_ref', 'in', [shopifyOrderName, nameClean, `#${nameClean}`]]]],
   ]);
-  if (!ids || ids.length === 0) return null;
+  if (!ids || ids.length === 0) {
+    console.warn(`Odoo order not found for shopify ref "${shopifyOrderName}" — tried client_order_ref`);
+    return null;
+  }
   const records = await odooCall('/xmlrpc/2/object', 'execute_kw', [
     ODOO_DB, uid, ODOO_PASSWORD,
     'sale.order', 'read',
-    [ids, ['id', 'name', 'state']],
+    [ids, ['id', 'name', 'state', 'client_order_ref']],
   ]);
+  console.log(`Found Odoo order:`, JSON.stringify(records[0]));
   return records[0] || null;
 }
 
@@ -225,9 +232,7 @@ app.post('/webhook/meta', async (req, res) => {
           type: 'text',
           text: { body: `❌ تم إلغاء طلبك ${order.orderNumber}.\nيمكنك الطلب مجدداً في أي وقت 🛍️` },
         });
-        // Cancel in Shopify directly
-        await cancelShopifyOrder(order.shopifyOrderId);
-        // Cancel in Odoo (unlock first, then cancel)
+        // Cancel in Odoo (unlock first, then cancel) — Odoo connector syncs to Shopify automatically
         try {
           const odooOrder = await findOdooOrder(order.orderNumber);
           if (odooOrder) await cancelOdooOrder(odooOrder.id);
