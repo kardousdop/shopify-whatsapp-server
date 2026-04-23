@@ -267,6 +267,33 @@ async function cancelInOdooWithRetry(orderNumber, retriesLeft, intervalMs) {
   setTimeout(() => cancelInOdooWithRetry(orderNumber, retriesLeft - 1, intervalMs), intervalMs);
 }
 
+// ─── Auto-Confirm Logic ───────────────────────────────────────────────────────
+function scheduleAutoConfirm(phone, shopifyOrderId, orderNumber, createdAt) {
+  const FOUR_HOURS = 4 * 60 * 60 * 1000;
+  const elapsed    = Date.now() - createdAt;
+  const remaining  = Math.max(FOUR_HOURS - elapsed, 0);
+
+  console.log(`[AutoConfirm] ${orderNumber} — auto-confirm in ${Math.round(remaining / 60000)} min`);
+
+  setTimeout(async () => {
+    const current = pendingOrders.get(phone);
+    if (!current || current.shopifyOrderId !== shopifyOrderId || current.status !== 'pending') return;
+    console.log(`[AutoConfirm] ${orderNumber} — 4h elapsed, confirming now`);
+    current.status = 'confirmed';
+    pendingOrders.set(phone, current);
+    saveOrders(pendingOrders);
+    await tagShopifyOrder(shopifyOrderId, 'COD-Confirmed');
+    await sendWA(phone, `✅ تم تأكيد طلبك ${orderNumber} تلقائياً.\nشكراً لك، سيتم شحن طلبك قريباً 🎉`);
+  }, remaining);
+}
+
+// Restore timers for all pending orders loaded from disk on startup
+for (const [phone, order] of pendingOrders) {
+  if (order.status === 'pending' && order.createdAt) {
+    scheduleAutoConfirm(phone, order.shopifyOrderId, order.orderNumber, order.createdAt);
+  }
+}
+
 // ─── Meta Webhook: Verify ─────────────────────────────────────────────────────
 app.get('/webhook/meta', (req, res) => {
   if (req.query['hub.mode'] === 'subscribe' &&
@@ -356,20 +383,11 @@ app.post('/webhook/shopify', async (req, res) => {
     console.log('[Order] WA result:', JSON.stringify(waResult));
 
     await tagShopifyOrder(order.id, 'COD-Pending');
-    pendingOrders.set(phone, { shopifyOrderId: order.id, orderNumber, totalPrice, status: 'pending' });
+    const createdAt = Date.now();
+    pendingOrders.set(phone, { shopifyOrderId: order.id, orderNumber, totalPrice, status: 'pending', createdAt });
     saveOrders(pendingOrders);
 
-    // Auto-confirm after 4 hours if customer never replies
-    setTimeout(async () => {
-      const current = pendingOrders.get(phone);
-      if (!current || current.shopifyOrderId !== order.id || current.status !== 'pending') return;
-      console.log(`[AutoConfirm] ${orderNumber} — no reply after 4h, auto-confirming`);
-      current.status = 'confirmed';
-      pendingOrders.set(phone, current);
-      saveOrders(pendingOrders);
-      await tagShopifyOrder(order.id, 'COD-Confirmed');
-      await sendWA(phone, `✅ تم تأكيد طلبك ${orderNumber} تلقائياً.\nشكراً لك، سيتم شحن طلبك قريباً 🎉`);
-    }, 4 * 60 * 60 * 1000);
+    scheduleAutoConfirm(phone, order.id, orderNumber, createdAt);
 
   } catch (e) {
     console.error('[Order Webhook] Error:', e.message, e.stack);
