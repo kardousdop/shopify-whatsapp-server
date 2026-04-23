@@ -450,6 +450,43 @@ app.post('/webhook/checkout', async (req, res) => {
   }
 });
 
+// ─── Admin: Confirm all COD-Pending orders older than 4 hours ────────────────
+app.get('/admin/confirm-overdue', async (req, res) => {
+  const results = [];
+  try {
+    // Fetch all orders tagged COD-Pending from Shopify
+    const data = await shopifyFetch('orders.json?tag=COD-Pending&status=open&limit=250');
+    const orders = data.orders || [];
+    results.push(`Found ${orders.length} COD-Pending orders`);
+
+    const FOUR_HOURS = 4 * 60 * 60 * 1000;
+    let confirmed = 0;
+
+    for (const order of orders) {
+      const createdAt = new Date(order.created_at).getTime();
+      const age = Date.now() - createdAt;
+      if (age < FOUR_HOURS) {
+        results.push(`${order.name} — ${Math.round(age/60000)}min old, skipping`);
+        continue;
+      }
+
+      const addr  = order.shipping_address || order.billing_address || {};
+      const phone = normalizePhone(addr.phone || order.phone || '');
+      results.push(`${order.name} — ${Math.round(age/3600000)}h old → confirming (phone:${phone})`);
+
+      await tagShopifyOrder(order.id, 'COD-Confirmed');
+      if (phone) {
+        await sendWA(phone, `✅ تم تأكيد طلبك ${order.name} تلقائياً.\nشكراً لك، سيتم شحن طلبك قريباً 🎉`);
+      }
+      confirmed++;
+    }
+    results.push(`\nDone — confirmed ${confirmed} orders`);
+  } catch (e) {
+    results.push(`ERROR: ${e.message}`);
+  }
+  res.send('<pre>' + results.join('\n') + '</pre>');
+});
+
 // ─── Admin: Test Odoo cancel (remove after confirmed working) ─────────────────
 app.get('/admin/cancel-odoo/:odooId', async (req, res) => {
   const odooId = parseInt(req.params.odooId);
