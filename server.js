@@ -1,6 +1,8 @@
 'use strict';
 const express = require('express');
 const crypto  = require('crypto');
+const fs      = require('fs');
+const path    = require('path');
 
 const {
   META_PHONE_NUMBER_ID, META_ACCESS_TOKEN, META_APP_SECRET, META_VERIFY_TOKEN,
@@ -17,8 +19,30 @@ app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
 
-const pendingOrders   = new Map(); // phone → { shopifyOrderId, orderNumber, totalPrice, status }
-const pendingCheckouts = new Map(); // token → { phone, timer }
+// ─── Persistent Orders (survives server restarts) ─────────────────────────────
+const ORDERS_FILE = path.join('/tmp', 'pending_orders.json');
+
+function loadOrders() {
+  try {
+    if (fs.existsSync(ORDERS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8'));
+      console.log(`[Store] Loaded ${Object.keys(data).length} pending orders from disk`);
+      return new Map(Object.entries(data));
+    }
+  } catch (e) { console.error('[Store] Load error:', e.message); }
+  return new Map();
+}
+
+function saveOrders(map) {
+  try {
+    const obj = {};
+    for (const [k, v] of map) obj[k] = v;
+    fs.writeFileSync(ORDERS_FILE, JSON.stringify(obj), 'utf8');
+  } catch (e) { console.error('[Store] Save error:', e.message); }
+}
+
+const pendingOrders   = loadOrders(); // phone → { shopifyOrderId, orderNumber, totalPrice, status }
+const pendingCheckouts = new Map();   // token → { phone, timer } (timers can't be persisted)
 
 // ─── Phone normalization ──────────────────────────────────────────────────────
 function normalizePhone(phone) {
@@ -278,17 +302,22 @@ app.post('/webhook/meta', async (req, res) => {
 
       if (isConfirm) {
         order.status = 'confirmed';
+        pendingOrders.set(from, order);
+        saveOrders(pendingOrders);
         console.log(`[Confirm] ${order.orderNumber} confirmed by ${from}`);
         await tagShopifyOrder(order.shopifyOrderId, 'COD-Confirmed');
         await sendWA(from, `✅ تم تأكيد طلبك ${order.orderNumber} بنجاح!\nشكراً لك، سيتم شحن طلبك قريباً 🎉`);
 
       } else if (isCancel) {
         order.status = 'cancelled';
+        pendingOrders.set(from, order);
+        saveOrders(pendingOrders);
         console.log(`[Cancel] ${order.orderNumber} cancelled by ${from}`);
         await tagShopifyOrder(order.shopifyOrderId, 'COD-Cancelled');
         await sendWA(from, `❌ تم إلغاء طلبك ${order.orderNumber}.\nيمكنك الطلب مجدداً في أي وقت 🛍️`);
         cancelInOdooWithRetry(order.orderNumber, 20, 3 * 60 * 1000);
         pendingOrders.delete(from);
+        saveOrders(pendingOrders);
 
       } else {
         await sendWA(from, `للتأكيد اضغط *1*\nللإلغاء اضغط *2*`);
@@ -328,6 +357,7 @@ app.post('/webhook/shopify', async (req, res) => {
 
     await tagShopifyOrder(order.id, 'COD-Pending');
     pendingOrders.set(phone, { shopifyOrderId: order.id, orderNumber, totalPrice, status: 'pending' });
+    saveOrders(pendingOrders);
 
   } catch (e) {
     console.error('[Order Webhook] Error:', e.message, e.stack);
