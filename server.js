@@ -288,9 +288,11 @@ function scheduleAutoConfirm(phone, shopifyOrderId, orderNumber, createdAt) {
 }
 
 // Restore timers for all pending orders loaded from disk on startup
+// If createdAt is missing (old orders), treat as already overdue → confirms immediately
 for (const [phone, order] of pendingOrders) {
-  if (order.status === 'pending' && order.createdAt) {
-    scheduleAutoConfirm(phone, order.shopifyOrderId, order.orderNumber, order.createdAt);
+  if (order.status === 'pending') {
+    const createdAt = order.createdAt || (Date.now() - 5 * 60 * 60 * 1000);
+    scheduleAutoConfirm(phone, order.shopifyOrderId, order.orderNumber, createdAt);
   }
 }
 
