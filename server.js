@@ -454,12 +454,12 @@ app.post('/webhook/checkout', async (req, res) => {
 app.get('/admin/confirm-overdue', async (req, res) => {
   const results = [];
   try {
-    // Fetch all orders tagged COD-Pending from Shopify
     const data = await shopifyFetch('orders.json?tag=COD-Pending&status=open&limit=250');
     const orders = data.orders || [];
-    results.push(`Found ${orders.length} COD-Pending orders`);
+    results.push(`Found ${orders.length} COD-Pending orders\n`);
 
     const FOUR_HOURS = 4 * 60 * 60 * 1000;
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
     let confirmed = 0;
 
     for (const order of orders) {
@@ -472,17 +472,29 @@ app.get('/admin/confirm-overdue', async (req, res) => {
 
       const addr  = order.shipping_address || order.billing_address || {};
       const phone = normalizePhone(addr.phone || order.phone || '');
-      results.push(`${order.name} — ${Math.round(age/3600000)}h old → confirming (phone:${phone})`);
 
-      await tagShopifyOrder(order.id, 'COD-Confirmed');
-      if (phone) {
-        await sendWA(phone, `✅ تم تأكيد طلبك ${order.name} تلقائياً.\nشكراً لك، سيتم شحن طلبك قريباً 🎉`);
+      try {
+        await tagShopifyOrder(order.id, 'COD-Confirmed');
+        results.push(`${order.name} ✅ tag updated (phone:${phone})`);
+        confirmed++;
+      } catch (e) {
+        results.push(`${order.name} ❌ tag FAILED: ${e.message}`);
       }
-      confirmed++;
+
+      // Send WhatsApp (don't block on failure)
+      if (phone) {
+        try {
+          await sendWA(phone, `✅ تم تأكيد طلبك ${order.name} تلقائياً.\nشكراً لك، سيتم شحن طلبك قريباً 🎉`);
+        } catch (e) {
+          results.push(`  WA failed for ${phone}: ${e.message}`);
+        }
+      }
+
+      await sleep(600); // 600ms between orders — stay under Shopify rate limit
     }
     results.push(`\nDone — confirmed ${confirmed} orders`);
   } catch (e) {
-    results.push(`ERROR: ${e.message}`);
+    results.push(`FATAL ERROR: ${e.message}`);
   }
   res.send('<pre>' + results.join('\n') + '</pre>');
 });
