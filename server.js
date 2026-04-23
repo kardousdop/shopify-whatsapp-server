@@ -359,6 +359,18 @@ app.post('/webhook/shopify', async (req, res) => {
     pendingOrders.set(phone, { shopifyOrderId: order.id, orderNumber, totalPrice, status: 'pending' });
     saveOrders(pendingOrders);
 
+    // Auto-confirm after 4 hours if customer never replies
+    setTimeout(async () => {
+      const current = pendingOrders.get(phone);
+      if (!current || current.shopifyOrderId !== order.id || current.status !== 'pending') return;
+      console.log(`[AutoConfirm] ${orderNumber} — no reply after 4h, auto-confirming`);
+      current.status = 'confirmed';
+      pendingOrders.set(phone, current);
+      saveOrders(pendingOrders);
+      await tagShopifyOrder(order.id, 'COD-Confirmed');
+      await sendWA(phone, `✅ تم تأكيد طلبك ${orderNumber} تلقائياً.\nشكراً لك، سيتم شحن طلبك قريباً 🎉`);
+    }, 4 * 60 * 60 * 1000);
+
   } catch (e) {
     console.error('[Order Webhook] Error:', e.message, e.stack);
   }
