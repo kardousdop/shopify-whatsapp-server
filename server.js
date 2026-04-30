@@ -62,7 +62,7 @@ function restoreAbandonedTimers() {
   for (const [token, checkout] of Object.entries(abandonedCheckouts)) {
     if (!checkout.reminded && !checkout.completed) {
       const elapsed   = now - checkout.createdAt;
-      const delay     = Math.max(0, (60 * 60 * 1000) - elapsed); // 1 hour from creation
+      const delay     = Math.max(0, (15 * 60 * 1000) - elapsed); // 1 hour from creation
       abandonedTimers[token] = setTimeout(() => sendAbandonedReminder(token), delay);
       restored++;
     }
