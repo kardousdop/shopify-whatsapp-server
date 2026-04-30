@@ -206,7 +206,7 @@ app.post('/webhook/checkout', async (req, res) => {
   // Set 1-hour reminder timer
   abandonedTimers[checkout.token] = setTimeout(
     () => sendAbandonedReminder(checkout.token),
-    60 * 60 * 1000   // 1 hour
+    2 * 60 * 1000   // 2 min test
   );
 
   console.log(`🛒 Abandoned checkout saved for ${phone} — reminder in 1 hour`);
