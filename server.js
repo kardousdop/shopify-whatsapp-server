@@ -151,7 +151,7 @@ app.post('/webhook/order-created', async (req, res) => {
 // ================================================================
 // 2. SHOPIFY — ABANDONED CHECKOUT  ← NEW
 // ================================================================
-app.post('/webhook/checkout-abandoned', async (req, res) => {
+app.post('/webhook/checkout', async (req, res) => {
   if (!verifyShopifyWebhook(req)) return res.status(401).send('Unauthorized');
   res.status(200).send('ok');
 
