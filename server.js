@@ -64,7 +64,7 @@ function restoreAbandonedTimers() {
   for (const [token, checkout] of Object.entries(abandonedCheckouts)) {
     if (!checkout.reminded && !checkout.completed) {
       const elapsed = now - checkout.createdAt;
-      const delay   = Math.max(0, (60 * 60 * 1000) - elapsed);
+      const delay   = Math.max(0, (15 * 60 * 1000) - elapsed);
       abandonedTimers[token] = setTimeout(() => sendAbandonedReminder(token), delay);
       restored++;
     }
@@ -200,7 +200,7 @@ app.post('/webhook/checkout', async (req, res) => {
 
   abandonedTimers[checkout.token] = setTimeout(
     () => sendAbandonedReminder(checkout.token),
-    60 * 60 * 1000  // 1 hour
+    15 * 60 * 1000  // 15 min
   );
 
   console.log(`🛒 Abandoned checkout saved for ${phone} — reminder in 1 hour`);
@@ -606,6 +606,29 @@ app.post('/admin/bulk-send', async (req, res) => {
 
   console.log(`📤 Bulk send done: ${sent} sent, ${failed} failed`);
   res.json({ sent, failed, errors });
+});
+
+
+// ================================================================
+// ADMIN — TEST ABANDONED CHECKOUT REMINDER
+// GET /admin/test-abandoned?phone=201004444558
+// ================================================================
+app.get('/admin/test-abandoned', async (req, res) => {
+  const phone = req.query.phone;
+  if (!phone) return res.json({ error: 'phone param required' });
+
+  const msg =
+    `مرحباً! 👋\n\n` +
+    `لاحظنا إنك سبت منتجات في سلتك على myMayz 🛒\n\n` +
+    `🛍️ Alkaline Clay Water Bottle ×1\n` +
+    `💰 الإجمالي: 784 EGP\n\n` +
+    `سلتك لسه موجودة! أكمل طلبك هنا:\n` +
+    `👉 https://mymayz.com\n\n` +
+    `لو محتاج مساعدة كلمنا في أي وقت 🙏`;
+
+  await sendWA(phone, msg);
+  console.log(`🧪 Test abandoned reminder sent to ${phone}`);
+  res.json({ sent: true, to: phone });
 });
 
 // ================================================================
