@@ -4,8 +4,9 @@
 //   ✅ Order confirmation (COD + Card)
 //   ✅ Odoo cancel on customer reply
 //   ✅ Auto-confirm overdue orders
-//   ✅ Abandoned checkout WhatsApp reminder  ← NEW
+//   ✅ Abandoned checkout WhatsApp reminder
 //   ✅ Meta WhatsApp Cloud API
+//   ✅ Odoo tagging (COD-Confirmed / COD-Cancelled / COD-Pending)
 // ================================================================
 
 const express = require('express');
@@ -46,7 +47,7 @@ const ABANDONED_FILE   = './abandonedCheckouts.json';
 
 let pendingOrders      = loadJSON(PENDING_FILE);
 let abandonedCheckouts = loadJSON(ABANDONED_FILE);
-let abandonedTimers    = {};   // checkoutToken → setTimeout handle
+let abandonedTimers    = {};
 
 function loadJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
@@ -61,8 +62,8 @@ function restoreAbandonedTimers() {
   let restored = 0;
   for (const [token, checkout] of Object.entries(abandonedCheckouts)) {
     if (!checkout.reminded && !checkout.completed) {
-      const elapsed   = now - checkout.createdAt;
-      const delay     = Math.max(0, (15 * 60 * 1000) - elapsed); // 1 hour from creation
+      const elapsed = now - checkout.createdAt;
+      const delay   = Math.max(0, (60 * 60 * 1000) - elapsed);
       abandonedTimers[token] = setTimeout(() => sendAbandonedReminder(token), delay);
       restored++;
     }
@@ -76,8 +77,8 @@ function restoreOrderTimers() {
   let restored = 0;
   for (const [phone, order] of Object.entries(pendingOrders)) {
     if (!order.confirmed && !order.cancelled) {
-      const elapsed  = now - order.sentAt;
-      const delay    = Math.max(0, (60 * 60 * 1000) - elapsed); // 1 hour
+      const elapsed = now - order.sentAt;
+      const delay   = Math.max(0, (60 * 60 * 1000) - elapsed);
       setTimeout(() => retryIfNoReply(phone), delay);
       restored++;
     }
@@ -89,7 +90,7 @@ function restoreOrderTimers() {
 // SHOPIFY WEBHOOK — verify signature
 // ================================================================
 function verifyShopifyWebhook(req) {
-  if (!SHOPIFY_WEBHOOK_SECRET) return true; // skip in dev
+  if (!SHOPIFY_WEBHOOK_SECRET) return true;
   const hmac = req.headers['x-shopify-hmac-sha256'];
   if (!hmac) return false;
   const hash = crypto
@@ -114,20 +115,19 @@ app.post('/webhook/order-created', async (req, res) => {
   const name  = o.customer?.first_name || 'عميلنا';
   const items = (o.line_items || []).map(i => `${i.name} ×${i.quantity}`).join('، ');
 
-  // If this customer had an abandoned checkout timer → cancel it (they completed!)
   cancelAbandonedTimerByPhone(phone);
 
   pendingOrders[phone] = {
-    orderNo:    o.order_number,
-    shopifyId:  String(o.id),
+    orderNo:   o.order_number,
+    shopifyId: String(o.id),
     name,
-    total:      o.total_price,
+    total:     o.total_price,
     isCOD,
-    gateway:    o.payment_gateway,
-    sentAt:     Date.now(),
-    retried:    false,
-    confirmed:  false,
-    cancelled:  false
+    gateway:   o.payment_gateway,
+    sentAt:    Date.now(),
+    retried:   false,
+    confirmed: false,
+    cancelled: false
   };
   saveJSON(PENDING_FILE, pendingOrders);
 
@@ -144,12 +144,11 @@ app.post('/webhook/order-created', async (req, res) => {
     `❌ اكتب *2* للإلغاء`
   );
 
-  // Retry after 1 hour if no reply
   setTimeout(() => retryIfNoReply(phone), 60 * 60 * 1000);
 });
 
 // ================================================================
-// 2. SHOPIFY — ABANDONED CHECKOUT  ← NEW
+// 2. SHOPIFY — ABANDONED CHECKOUT
 // ================================================================
 app.post('/webhook/checkout', async (req, res) => {
   if (!verifyShopifyWebhook(req)) return res.status(401).send('Unauthorized');
@@ -162,19 +161,16 @@ app.post('/webhook/checkout', async (req, res) => {
     checkout.phone
   );
 
-  // Shopify also fires this for email-only checkouts — skip if no phone
   if (!phone) {
     console.log(`⚠️  Abandoned checkout ${checkout.token} — no phone number, skipping`);
     return;
   }
 
-  // Skip if customer already has a pending order confirmation
   if (pendingOrders[phone]) {
     console.log(`ℹ️  Abandoned checkout for ${phone} — already has pending order, skipping`);
     return;
   }
 
-  // Skip if we already have a timer for this checkout
   if (abandonedCheckouts[checkout.token]?.reminded) {
     console.log(`ℹ️  Abandoned checkout ${checkout.token} already reminded`);
     return;
@@ -185,28 +181,25 @@ app.post('/webhook/checkout', async (req, res) => {
                 'عميلنا';
   const items = (checkout.line_items || []).map(i => `${i.title} ×${i.quantity}`).join('، ');
   const total = checkout.total_price || '0.00';
-  const url   = checkout.abandoned_checkout_url || `https://mymayz.com`;
+  const url   = checkout.abandoned_checkout_url || 'https://mymayz.com';
 
-  // Save the checkout
   abandonedCheckouts[checkout.token] = {
     phone,
     name,
     items,
     total,
     url,
-    createdAt:  Date.now(),
-    reminded:   false,
-    completed:  false
+    createdAt: Date.now(),
+    reminded:  false,
+    completed: false
   };
   saveJSON(ABANDONED_FILE, abandonedCheckouts);
 
-  // Cancel any existing timer for this phone (duplicate checkout events)
   cancelAbandonedTimerByPhone(phone);
 
-  // Set 1-hour reminder timer
   abandonedTimers[checkout.token] = setTimeout(
     () => sendAbandonedReminder(checkout.token),
-    15 * 60 * 1000   // 15 min
+    60 * 60 * 1000  // 1 hour
   );
 
   console.log(`🛒 Abandoned checkout saved for ${phone} — reminder in 1 hour`);
@@ -283,7 +276,6 @@ app.post('/webhook/whatsapp', async (req, res) => {
   if (!order) return;
 
   if (reply === '1') {
-    // ── CONFIRMED ─────────────────────────────────────────────
     order.confirmed = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
@@ -298,7 +290,6 @@ app.post('/webhook/whatsapp', async (req, res) => {
     saveJSON(PENDING_FILE, pendingOrders);
 
   } else if (reply === '2') {
-    // ── CANCEL ────────────────────────────────────────────────
     order.cancelled = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
@@ -311,6 +302,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
             `يمكنك الطلب مرة أخرى في أي وقت 🙏`
           : `تم استلام طلب الإلغاء.\nسيتم المعالجة خلال 24 ساعة 🙏`
       );
+      await tagOdooOrder(order.shopifyId, 'wa-cancelled');
     } else {
       const [odooOk, refund] = await Promise.all([
         odooCancel(order.shopifyId),
@@ -328,6 +320,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
           `⚠️ سيتم معالجة الاسترداد يدوياً خلال 24 ساعة 🙏`
         );
       }
+      await tagOdooOrder(order.shopifyId, 'wa-cancelled');
     }
 
     delete pendingOrders[from];
@@ -352,7 +345,6 @@ async function retryIfNoReply(phone) {
     `إذا لم نتلقَ ردًا، سيتم تعليق الطلب تلقائياً.`
   );
 
-  // Hold after another 2 hours with no reply
   setTimeout(() => holdIfNoReply(phone), 2 * 60 * 60 * 1000);
 }
 
@@ -410,7 +402,6 @@ async function odooRpc(model, method, args, kwargs = {}) {
 async function odooCancel(shopifyOrderId) {
   try {
     await odooAuth();
-    // Try both field names used by different connector versions
     let orders = await odooRpc('sale.order', 'search_read',
       [[ ['shopify_order_id', '=', String(shopifyOrderId)] ]],
       { fields: ['id', 'name', 'state'], limit: 1 }
@@ -432,16 +423,52 @@ async function odooCancel(shopifyOrderId) {
   }
 }
 
+// ================================================================
+// ODOO TAGGING — maps WA tag names to your Odoo tag names
+// ================================================================
 async function tagOdooOrder(shopifyOrderId, tagName) {
   try {
     await odooAuth();
+
+    // Map internal names → your actual Odoo tag names
+    const tagNameMap = {
+      'wa-confirmed':   'COD-Confirmed',
+      'wa-cancelled':   'COD-Cancelled',
+      'wa-no-response': 'COD-Pending',
+    };
+    const odooTagName = tagNameMap[tagName] || tagName;
+
+    // Search for tag by name (try crm.tag first, then sale.order.tag)
+    let tagId = null;
+    for (const model of ['crm.tag', 'sale.order.tag']) {
+      const tags = await odooRpc(model, 'search_read',
+        [[ ['name', '=', odooTagName] ]],
+        { fields: ['id', 'name'], limit: 1 }
+      );
+      if (tags?.length) { tagId = tags[0].id; break; }
+    }
+
+    if (!tagId) {
+      console.log(`⚠️  Odoo tag "${odooTagName}" not found in Odoo`);
+      return;
+    }
+
+    // Find the sale order
     const orders = await odooRpc('sale.order', 'search_read',
       [[ ['shopify_order_id', '=', String(shopifyOrderId)] ]],
-      { fields: ['id'], limit: 1 }
+      { fields: ['id', 'name', 'tag_ids'], limit: 1 }
     );
-    if (!orders?.length) return;
-    // Find or note the tag (assumes tags already created in Odoo)
-    console.log(`🏷️  Odoo: tag "${tagName}" noted for order ${shopifyOrderId}`);
+    if (!orders?.length) {
+      console.log(`⚠️  Odoo order not found for Shopify ID ${shopifyOrderId}`);
+      return;
+    }
+
+    // Add tag (4 = link existing record without replacing others)
+    await odooRpc('sale.order', 'write',
+      [[orders[0].id], { tag_ids: [[4, tagId]] }],
+      {}
+    );
+    console.log(`🏷️  Odoo: tagged order ${orders[0].name} with "${odooTagName}" ✅`);
   } catch(e) {
     console.error('Odoo tag error:', e.message);
   }
@@ -527,7 +554,7 @@ function normalisePhone(phone) {
   let p = String(phone).replace(/[\s\-\(\)]/g, '');
   if (p.startsWith('0')) p = '+20' + p.slice(1);
   if (!p.startsWith('+')) p = '+' + p;
-  return p.replace('+', ''); // Meta API expects no +
+  return p.replace('+', '');
 }
 
 function isCodOrder(order) {
@@ -540,11 +567,11 @@ function isCodOrder(order) {
 // ================================================================
 app.get('/', (req, res) => {
   res.json({
-    status:           'running',
-    time:             new Date().toISOString(),
-    pendingOrders:    Object.keys(pendingOrders).length,
-    abandonedTimers:  Object.keys(abandonedTimers).length,
-    abandonedTotal:   Object.keys(abandonedCheckouts).length
+    status:          'running',
+    time:            new Date().toISOString(),
+    pendingOrders:   Object.keys(pendingOrders).length,
+    abandonedTimers: Object.keys(abandonedTimers).length,
+    abandonedTotal:  Object.keys(abandonedCheckouts).length
   });
 });
 
