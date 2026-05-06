@@ -7,6 +7,7 @@
 //   ✅ Abandoned checkout WhatsApp reminder
 //   ✅ Meta WhatsApp Cloud API
 //   ✅ Odoo tagging (COD-Confirmed / COD-Cancelled / COD-Pending)
+//   ✅ Bulk send endpoint for manual campaigns
 // ================================================================
 
 const express = require('express');
@@ -424,13 +425,11 @@ async function odooCancel(shopifyOrderId) {
 }
 
 // ================================================================
-// ODOO TAGGING — maps WA tag names to your Odoo tag names
+// ODOO TAGGING
 // ================================================================
 async function tagOdooOrder(shopifyOrderId, tagName) {
   try {
     await odooAuth();
-
-    // Map internal names → your actual Odoo tag names
     const tagNameMap = {
       'wa-confirmed':   'COD-Confirmed',
       'wa-cancelled':   'COD-Cancelled',
@@ -438,7 +437,6 @@ async function tagOdooOrder(shopifyOrderId, tagName) {
     };
     const odooTagName = tagNameMap[tagName] || tagName;
 
-    // Search for tag by name (try crm.tag first, then sale.order.tag)
     let tagId = null;
     for (const model of ['crm.tag', 'sale.order.tag']) {
       const tags = await odooRpc(model, 'search_read',
@@ -448,27 +446,18 @@ async function tagOdooOrder(shopifyOrderId, tagName) {
       if (tags?.length) { tagId = tags[0].id; break; }
     }
 
-    if (!tagId) {
-      console.log(`⚠️  Odoo tag "${odooTagName}" not found in Odoo`);
-      return;
-    }
+    if (!tagId) { console.log(`⚠️  Odoo tag "${odooTagName}" not found`); return; }
 
-    // Find the sale order
     const orders = await odooRpc('sale.order', 'search_read',
       [[ ['shopify_order_id', '=', String(shopifyOrderId)] ]],
       { fields: ['id', 'name', 'tag_ids'], limit: 1 }
     );
-    if (!orders?.length) {
-      console.log(`⚠️  Odoo order not found for Shopify ID ${shopifyOrderId}`);
-      return;
-    }
+    if (!orders?.length) { console.log(`⚠️  Odoo order not found for ${shopifyOrderId}`); return; }
 
-    // Add tag (4 = link existing record without replacing others)
     await odooRpc('sale.order', 'write',
-      [[orders[0].id], { tag_ids: [[4, tagId]] }],
-      {}
+      [[orders[0].id], { tag_ids: [[4, tagId]] }], {}
     );
-    console.log(`🏷️  Odoo: tagged order ${orders[0].name} with "${odooTagName}" ✅`);
+    console.log(`🏷️  Odoo: tagged ${orders[0].name} with "${odooTagName}" ✅`);
   } catch(e) {
     console.error('Odoo tag error:', e.message);
   }
@@ -580,6 +569,43 @@ app.get('/', (req, res) => {
 // ================================================================
 app.get('/admin/pending', (req, res) => {
   res.json(pendingOrders);
+});
+
+// ================================================================
+// ADMIN — BULK SEND  ← NEW
+// POST /admin/bulk-send
+// Body: { "orders": [ { "phone", "firstName", "name", "total", "items" } ] }
+// ================================================================
+app.post('/admin/bulk-send', async (req, res) => {
+  const orders = req.body.orders || [];
+  if (!orders.length) return res.json({ sent: 0, failed: 0, errors: ['No orders provided'] });
+
+  console.log(`📤 Bulk send started for ${orders.length} orders`);
+  let sent = 0, failed = 0, errors = [];
+
+  for (const o of orders) {
+    if (!o.phone) { failed++; errors.push(`${o.name}: no phone`); continue; }
+    const msg =
+      `مرحباً ${o.firstName || 'عميلنا'}! 👋\n\n` +
+      `شكراً لطلبك من myMayz 🎉\n\n` +
+      `📦 رقم الطلب: ${o.name}\n` +
+      `💵 المبلغ عند الاستلام: ${o.total} EGP\n` +
+      `🛍️ ${o.items}\n\n` +
+      `يرجى تأكيد طلبك الآن:\n` +
+      `✅ اكتب *1* للتأكيد\n` +
+      `❌ اكتب *2* للإلغاء`;
+    try {
+      await sendWA(o.phone, msg);
+      sent++;
+    } catch(e) {
+      failed++;
+      errors.push(`${o.name}: ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, 350)); // rate limit delay
+  }
+
+  console.log(`📤 Bulk send done: ${sent} sent, ${failed} failed`);
+  res.json({ sent, failed, errors });
 });
 
 // ================================================================
