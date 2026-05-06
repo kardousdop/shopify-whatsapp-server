@@ -211,15 +211,12 @@ async function sendAbandonedReminder(token) {
   const checkout = abandonedCheckouts[token];
   if (!checkout || checkout.reminded || checkout.completed) return;
 
-  await sendWA(checkout.phone,
-    `مرحباً ${checkout.name}! 👋\n\n` +
-    `لاحظنا إنك سبت منتجات في سلتك على myMayz 🛒\n\n` +
-    `🛍️ ${checkout.items}\n` +
-    `💰 الإجمالي: ${checkout.total} EGP\n\n` +
-    `سلتك لسه موجودة! أكمل طلبك هنا:\n` +
-    `👉 ${checkout.url}\n\n` +
-    `لو محتاج مساعدة كلمنا في أي وقت 🙏`
-  );
+  await sendWATemplate(checkout.phone, 'abandoned_cart_reminder', 'ar', [
+    checkout.name,
+    checkout.items,
+    checkout.total,
+    checkout.url
+  ]);
 
   abandonedCheckouts[token].reminded = true;
   saveJSON(ABANDONED_FILE, abandonedCheckouts);
@@ -535,6 +532,49 @@ async function sendWA(phone, message) {
   }
 }
 
+
+// ================================================================
+// META WHATSAPP — send template message (for outbound/abandoned cart)
+// ================================================================
+async function sendWATemplate(phone, templateName, languageCode, params) {
+  try {
+    const components = params.length > 0 ? [{
+      type: 'body',
+      parameters: params.map(p => ({ type: 'text', text: String(p) }))
+    }] : [];
+
+    const r = await fetch(
+      `https://graph.facebook.com/v19.0/${META_PHONE_NUMBER_ID}/messages`,
+      {
+        method:  'POST',
+        headers: {
+          'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
+          'Content-Type':  'application/json'
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          to:   phone,
+          type: 'template',
+          template: {
+            name:     templateName,
+            language: { code: languageCode },
+            components
+          }
+        })
+      }
+    );
+    const data = await r.json();
+    if (data.error) {
+      console.error(`❌ WA template error to ${phone}:`, JSON.stringify(data.error));
+    } else {
+      console.log(`✅ WA template "${templateName}" sent to ${phone}`);
+    }
+    return data;
+  } catch(e) {
+    console.error('sendWATemplate error:', e.message);
+  }
+}
+
 // ================================================================
 // HELPERS
 // ================================================================
@@ -617,17 +657,13 @@ app.get('/admin/test-abandoned', async (req, res) => {
   const phone = req.query.phone;
   if (!phone) return res.json({ error: 'phone param required' });
 
-  const msg =
-    `مرحباً! 👋\n\n` +
-    `لاحظنا إنك سبت منتجات في سلتك على myMayz 🛒\n\n` +
-    `🛍️ Alkaline Clay Water Bottle ×1\n` +
-    `💰 الإجمالي: 784 EGP\n\n` +
-    `سلتك لسه موجودة! أكمل طلبك هنا:\n` +
-    `👉 https://mymayz.com\n\n` +
-    `لو محتاج مساعدة كلمنا في أي وقت 🙏`;
-
-  await sendWA(phone, msg);
-  console.log(`🧪 Test abandoned reminder sent to ${phone}`);
+  await sendWATemplate(phone, 'abandoned_cart_reminder', 'ar', [
+    'عميلنا',
+    'Alkaline Clay Water Bottle ×1',
+    '784',
+    'https://mymayz.com'
+  ]);
+  console.log(`🧪 Test abandoned template sent to ${phone}`);
   res.json({ sent: true, to: phone });
 });
 
