@@ -684,6 +684,31 @@ app.get('/admin/phone-check', async (req, res) => {
   lines.push(`META_PHONE_NUMBER_ID : ${META_PHONE_NUMBER_ID}`);
   lines.push('');
 
+  // 0. Check WABA status
+  try {
+    const r0 = await fetch(
+      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}?fields=account_mode,certificate,code_verification_status,display_phone_number,quality_rating,status,name_status,new_name_status,decision,requested_verified_name`,
+      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
+    );
+    const d0 = await r0.json();
+    if (!d0.error) {
+      lines.push(`Account mode         : ${d0.account_mode || 'N/A'}`);
+      lines.push(`Name status          : ${d0.name_status || 'N/A'}`);
+      lines.push(`Code verify status   : ${d0.code_verification_status || 'N/A'}`);
+      lines.push(`Decision             : ${d0.decision || 'N/A'}`);
+      lines.push('');
+
+      if (d0.account_mode === 'SANDBOX') {
+        lines.push('⚠️  ACCOUNT IS IN SANDBOX MODE!');
+        lines.push('   In sandbox mode, messages can only be sent to numbers you explicitly added');
+        lines.push('   as test numbers in the Meta developer console.');
+        lines.push('   → You must switch to LIVE mode to send to real customers.');
+        lines.push('');
+      }
+    }
+  } catch(e) {}
+
+
   try {
     // 1. Get phone number details from Meta
     const r1 = await fetch(
@@ -730,6 +755,55 @@ app.get('/admin/phone-check', async (req, res) => {
     }
   } catch(e) {
     lines.push(`Profile check error: ${e.message}`);
+  }
+
+  res.send('<pre>' + lines.join('\n') + '</pre>');
+});
+
+// ================================================================
+// ADMIN — Send + immediately check delivery status
+// GET /admin/delivery-test?phone=201XXXXXXXXX
+// ================================================================
+app.get('/admin/delivery-test', async (req, res) => {
+  const phone = req.query.phone;
+  if (!phone) return res.send('<pre>Add ?phone=201XXXXXXXXX</pre>');
+  const lines = [];
+  lines.push(`Sending to: ${phone}`);
+
+  // Send message
+  const sr = await fetch(
+    `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/messages`,
+    {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: 'اختبار توصيل ✅' } })
+    }
+  );
+  const sd = await sr.json();
+  if (sd.error) {
+    lines.push(`❌ Send error [${sd.error.code}]: ${sd.error.message}`);
+    return res.send('<pre>' + lines.join('\n') + '</pre>');
+  }
+  const msgId = sd.messages?.[0]?.id;
+  lines.push(`✅ Sent — message ID: ${msgId}`);
+  lines.push('Waiting 3 seconds then checking delivery status...');
+
+  // Wait 3s then check status
+  await new Promise(r => setTimeout(r, 3000));
+  try {
+    const cr = await fetch(
+      `https://graph.facebook.com/${WA_API_VER}/${msgId}?fields=id,status,timestamp,errors`,
+      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
+    );
+    const cd = await cr.json();
+    if (cd.error) {
+      lines.push(`Status check error: ${cd.error.message}`);
+      lines.push('(This is normal — message status may not be queryable directly)');
+    } else {
+      lines.push(`Message status: ${JSON.stringify(cd)}`);
+    }
+  } catch(e) {
+    lines.push(`Status check failed: ${e.message}`);
   }
 
   res.send('<pre>' + lines.join('\n') + '</pre>');
