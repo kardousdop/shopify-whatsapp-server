@@ -280,13 +280,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
     order.confirmed = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
+    await tagShopifyOrder(order.shopifyId, 'wa-confirmed');
     await sendWA(from,
       `✅ تم تأكيد طلبك #${order.orderNo} بنجاح!\n` +
       `سيتم التجهيز والشحن قريباً 🎉\n\n` +
       `شكراً لثقتك في myMayz 🙏`
     );
 
-    await tagOdooOrder(order.shopifyId, 'wa-confirmed');
     delete pendingOrders[from];
     saveJSON(PENDING_FILE, pendingOrders);
 
@@ -294,35 +294,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
     order.cancelled = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
-    if (order.isCOD) {
-      const ok = await odooCancel(order.shopifyId);
-      await sendWA(from,
-        ok
-          ? `تم إلغاء طلبك #${order.orderNo} ✅\n` +
-            `لا توجد مبالغ محصلة (الدفع عند الاستلام).\n` +
-            `يمكنك الطلب مرة أخرى في أي وقت 🙏`
-          : `تم استلام طلب الإلغاء.\nسيتم المعالجة خلال 24 ساعة 🙏`
-      );
-      await tagOdooOrder(order.shopifyId, 'wa-cancelled');
-    } else {
-      const [odooOk, refund] = await Promise.all([
-        odooCancel(order.shopifyId),
-        shopifyRefund(order.shopifyId)
-      ]);
-      if (odooOk && refund.success) {
-        await sendWA(from,
-          `تم إلغاء طلبك #${order.orderNo} ✅\n\n` +
-          `💳 سيتم استرداد ${refund.amount} EGP تلقائياً\n` +
-          `⏱️ خلال 3–7 أيام عمل حسب بنكك 🙏`
-        );
-      } else {
-        await sendWA(from,
-          `تم إلغاء طلبك #${order.orderNo} ✅\n` +
-          `⚠️ سيتم معالجة الاسترداد يدوياً خلال 24 ساعة 🙏`
-        );
-      }
-      await tagOdooOrder(order.shopifyId, 'wa-cancelled');
-    }
+    await odooCancel(order.shopifyId);
+    await tagShopifyOrder(order.shopifyId, 'wa-cancelled');
+    await sendWA(from,
+      `تم إلغاء طلبك #${order.orderNo} ✅\n` +
+      `يمكنك الطلب مرة أخرى في أي وقت 🙏`
+    );
 
     delete pendingOrders[from];
     saveJSON(PENDING_FILE, pendingOrders);
@@ -356,7 +333,7 @@ async function holdIfNoReply(phone) {
   const order = pendingOrders[phone];
   if (!order || order.confirmed || order.cancelled) return;
 
-  await tagOdooOrder(order.shopifyId, 'wa-no-response');
+  await tagShopifyOrder(order.shopifyId, 'wa-no-response');
   await sendWA(phone,
     `تم تعليق طلبك #${order.orderNo} مؤقتاً لعدم الرد.\n` +
     `للتواصل معنا: https://wa.me/201004444558`
@@ -463,6 +440,35 @@ async function tagOdooOrder(shopifyOrderId, tagName) {
     console.log(`🏷️  Odoo: tagged ${orders[0].name} with "${odooTagName}" ✅`);
   } catch(e) {
     console.error('Odoo tag error:', e.message);
+  }
+}
+
+// ================================================================
+// SHOPIFY TAGGING
+// ================================================================
+async function tagShopifyOrder(shopifyOrderId, newTag) {
+  try {
+    const base    = `https://${SHOPIFY_STORE_URL}/admin/api/2024-01/orders/${shopifyOrderId}.json`;
+    const headers = { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' };
+
+    // Get current tags
+    const res  = await fetch(base, { headers });
+    const data = await res.json();
+    const currentTags = data.order?.tags || '';
+
+    // Append new tag (avoid duplicates)
+    const tagList = currentTags ? currentTags.split(',').map(t => t.trim()) : [];
+    if (!tagList.includes(newTag)) tagList.push(newTag);
+
+    await fetch(base, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ order: { id: shopifyOrderId, tags: tagList.join(', ') } })
+    });
+
+    console.log(`🏷️  Shopify: tagged order ${shopifyOrderId} with "${newTag}" ✅`);
+  } catch(e) {
+    console.error('Shopify tag error:', e.message);
   }
 }
 
