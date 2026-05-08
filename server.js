@@ -137,11 +137,10 @@ app.post('/webhook/order-created', async (req, res) => {
     ? `${o.total_price} EGP - الدفع عند الاستلام`
     : `${o.total_price} EGP - تم الدفع بالبطاقة`;
 
-  await sendWATemplate(phone, 'order_confirmation_cod', 'ar', [
+  await sendWATemplate(phone, 'sf_cod_confirmation_1773577120326', 'ar', [
     name,
     `#${o.order_number}`,
-    payInfo,
-    items
+    payInfo
   ]);
 
   setTimeout(() => retryIfNoReply(phone), 60 * 60 * 1000);
@@ -263,16 +262,21 @@ app.post('/webhook/whatsapp', async (req, res) => {
   const value   = changes?.value;
   if (!value?.messages) return;
 
-  const msg   = value.messages[0];
-  const from  = normalisePhone(msg.from);
-  const reply = (msg.text?.body || '').trim();
+  const msg  = value.messages[0];
+  const from = normalisePhone(msg.from);
 
-  console.log(`💬 WA reply from ${from}: "${reply}"`);
+  // Support both typed replies (1/2) and Quick Reply button taps
+  const textReply   = (msg.text?.body || '').trim().toLowerCase();
+  const buttonReply = (msg.button?.payload || msg.button?.text || '').trim().toLowerCase();
+  const isConfirm   = textReply === '1' || buttonReply.includes('confirm');
+  const isCancel    = textReply === '2' || buttonReply.includes('cancel');
+
+  console.log(`💬 WA reply from ${from}: text="${textReply}" button="${buttonReply}"`);
 
   const order = pendingOrders[from];
   if (!order) return;
 
-  if (reply === '1') {
+  if (isConfirm) {
     order.confirmed = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
@@ -286,7 +290,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
     delete pendingOrders[from];
     saveJSON(PENDING_FILE, pendingOrders);
 
-  } else if (reply === '2') {
+  } else if (isCancel) {
     order.cancelled = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
@@ -339,11 +343,10 @@ async function retryIfNoReply(phone) {
     ? `${order.total} EGP - الدفع عند الاستلام`
     : `${order.total} EGP - تم الدفع بالبطاقة`;
 
-  await sendWATemplate(phone, 'order_confirmation_cod', 'ar', [
+  await sendWATemplate(phone, 'sf_cod_confirmation_1773577120326', 'ar', [
     order.name,
     `#${order.orderNo}`,
-    retryPayInfo,
-    order.items || 'منتجات myMayz'
+    retryPayInfo
   ]);
 
   setTimeout(() => holdIfNoReply(phone), 2 * 60 * 60 * 1000);
@@ -636,11 +639,10 @@ app.post('/admin/bulk-send', async (req, res) => {
   for (const o of orders) {
     if (!o.phone) { failed++; errors.push(`${o.name}: no phone`); continue; }
     try {
-      await sendWATemplate(o.phone, 'order_confirmation_cod', 'ar', [
+      await sendWATemplate(o.phone, 'sf_cod_confirmation_1773577120326', 'ar', [
         o.firstName || 'عميلنا',
         o.name,
-        `${o.total} EGP - الدفع عند الاستلام`,
-        o.items || 'منتجات myMayz'
+        `${o.total} EGP - الدفع عند الاستلام`
       ]);
       sent++;
     } catch(e) {
