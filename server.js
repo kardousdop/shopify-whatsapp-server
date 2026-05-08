@@ -675,6 +675,67 @@ app.get('/admin/test-abandoned', async (req, res) => {
 });
 
 // ================================================================
+// ADMIN — Deep phone number diagnostics
+// GET /admin/phone-check
+// ================================================================
+app.get('/admin/phone-check', async (req, res) => {
+  const lines = [];
+  lines.push(`=== WhatsApp Phone Number Deep Check ===`);
+  lines.push(`META_PHONE_NUMBER_ID : ${META_PHONE_NUMBER_ID}`);
+  lines.push('');
+
+  try {
+    // 1. Get phone number details from Meta
+    const r1 = await fetch(
+      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}?fields=display_phone_number,verified_name,quality_rating,status,platform_type,throughput`,
+      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
+    );
+    const phone = await r1.json();
+    if (phone.error) {
+      lines.push(`❌ Phone number lookup error: ${phone.error.message}`);
+    } else {
+      lines.push(`Display number   : ${phone.display_phone_number || 'N/A'}`);
+      lines.push(`Verified name    : ${phone.verified_name || 'N/A'}`);
+      lines.push(`Status           : ${phone.status || 'N/A'}`);
+      lines.push(`Quality rating   : ${phone.quality_rating || 'N/A'}`);
+      lines.push(`Platform type    : ${phone.platform_type || 'N/A'}`);
+      lines.push(`Throughput tier  : ${phone.throughput?.max_daily_conversation_per_phone || 'N/A'}`);
+
+      if (phone.status !== 'CONNECTED') {
+        lines.push('');
+        lines.push(`⚠️  STATUS IS NOT "CONNECTED" — this is why messages are not delivered!`);
+        lines.push(`   Status "${phone.status}" means the number is not active/connected.`);
+      } else {
+        lines.push('');
+        lines.push(`✅ Phone number is CONNECTED and active`);
+      }
+    }
+  } catch(e) {
+    lines.push(`❌ Error: ${e.message}`);
+  }
+
+  lines.push('');
+
+  try {
+    // 2. Check WABA (WhatsApp Business Account) details
+    const r2 = await fetch(
+      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/whatsapp_business_profile?fields=about,address,description,email,profile_picture_url,websites,vertical`,
+      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
+    );
+    const profile = await r2.json();
+    if (profile.error) {
+      lines.push(`Business profile error: ${profile.error.message}`);
+    } else {
+      lines.push(`Business about   : ${profile.data?.[0]?.about || 'N/A'}`);
+    }
+  } catch(e) {
+    lines.push(`Profile check error: ${e.message}`);
+  }
+
+  res.send('<pre>' + lines.join('\n') + '</pre>');
+});
+
+// ================================================================
 // ADMIN — Test WhatsApp sending
 // GET /admin/test-wa?phone=201XXXXXXXXX
 // ================================================================
