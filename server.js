@@ -123,6 +123,7 @@ app.post('/webhook/order-created', async (req, res) => {
     shopifyId: String(o.id),
     name,
     total:     o.total_price,
+    items,
     isCOD,
     gateway:   o.payment_gateway,
     sentAt:    Date.now(),
@@ -132,18 +133,16 @@ app.post('/webhook/order-created', async (req, res) => {
   };
   saveJSON(PENDING_FILE, pendingOrders);
 
-  const payNote = isCOD ? '💵 الدفع عند الاستلام' : '💳 تم الدفع بالبطاقة';
+  const payInfo = isCOD
+    ? `${o.total_price} EGP - الدفع عند الاستلام`
+    : `${o.total_price} EGP - تم الدفع بالبطاقة`;
 
-  await sendWA(phone,
-    `مرحباً ${name}! 👋\n\n` +
-    `شكراً لطلبك من myMayz 🎉\n\n` +
-    `📦 رقم الطلب: #${o.order_number}\n` +
-    `${payNote} — ${o.total_price} EGP\n` +
-    `🛍️ ${items}\n\n` +
-    `يرجى تأكيد طلبك الآن:\n` +
-    `✅ اكتب *1* للتأكيد\n` +
-    `❌ اكتب *2* للإلغاء`
-  );
+  await sendWATemplate(phone, 'order_confirmation_cod', 'ar', [
+    name,
+    `#${o.order_number}`,
+    payInfo,
+    items
+  ]);
 
   setTimeout(() => retryIfNoReply(phone), 60 * 60 * 1000);
 });
@@ -336,12 +335,16 @@ async function retryIfNoReply(phone) {
   order.retried = true;
   saveJSON(PENDING_FILE, pendingOrders);
 
-  await sendWA(phone,
-    `مرحباً! لاحظنا أنك لم تؤكد طلبك #${order.orderNo} بعد ⏰\n\n` +
-    `✅ رد *1* للتأكيد\n` +
-    `❌ رد *2* للإلغاء\n\n` +
-    `إذا لم نتلقَ ردًا، سيتم تعليق الطلب تلقائياً.`
-  );
+  const retryPayInfo = order.isCOD
+    ? `${order.total} EGP - الدفع عند الاستلام`
+    : `${order.total} EGP - تم الدفع بالبطاقة`;
+
+  await sendWATemplate(phone, 'order_confirmation_cod', 'ar', [
+    order.name,
+    `#${order.orderNo}`,
+    retryPayInfo,
+    order.items || 'منتجات myMayz'
+  ]);
 
   setTimeout(() => holdIfNoReply(phone), 2 * 60 * 60 * 1000);
 }
@@ -632,17 +635,13 @@ app.post('/admin/bulk-send', async (req, res) => {
 
   for (const o of orders) {
     if (!o.phone) { failed++; errors.push(`${o.name}: no phone`); continue; }
-    const msg =
-      `مرحباً ${o.firstName || 'عميلنا'}! 👋\n\n` +
-      `شكراً لطلبك من myMayz 🎉\n\n` +
-      `📦 رقم الطلب: ${o.name}\n` +
-      `💵 المبلغ عند الاستلام: ${o.total} EGP\n` +
-      `🛍️ ${o.items}\n\n` +
-      `يرجى تأكيد طلبك الآن:\n` +
-      `✅ اكتب *1* للتأكيد\n` +
-      `❌ اكتب *2* للإلغاء`;
     try {
-      await sendWA(o.phone, msg);
+      await sendWATemplate(o.phone, 'order_confirmation_cod', 'ar', [
+        o.firstName || 'عميلنا',
+        o.name,
+        `${o.total} EGP - الدفع عند الاستلام`,
+        o.items || 'منتجات myMayz'
+      ]);
       sent++;
     } catch(e) {
       failed++;
