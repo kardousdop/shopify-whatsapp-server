@@ -1,12 +1,13 @@
 // ================================================================
 // shopify-whatsapp-server — server.js
 // Features:
-//   ✅ Order confirmation (COD + Card)
-//   ✅ Odoo cancel on customer reply
-//   ✅ Auto-confirm overdue orders
-//   ✅ Abandoned checkout WhatsApp reminder
-//   ✅ Meta WhatsApp Cloud API
-//   ✅ Odoo tagging (COD-Confirmed / COD-Cancelled / COD-Pending)
+//   ✅ Order confirmation via WhatsApp template (COD + Card)
+//   ✅ Customer taps Confirm/Cancel button on WhatsApp
+//   ✅ Confirm → Shopify tagged wa-confirmed
+//   ✅ Cancel → Odoo cancelled + Shopify tagged wa-cancelled
+//   ✅ No reply after 3h → Shopify tagged wa-no-response
+//   ✅ Abandoned checkout WhatsApp reminder (15 min)
+//   ✅ Meta WhatsApp Cloud API (permanent token, v22.0)
 //   ✅ Bulk send endpoint for manual campaigns
 // ================================================================
 
@@ -333,11 +334,11 @@ async function holdIfNoReply(phone) {
   const order = pendingOrders[phone];
   if (!order || order.confirmed || order.cancelled) return;
 
+  // Tag in Shopify only — can't send free-form WhatsApp since customer
+  // never replied (24h window closed), and we have no approved template for this
   await tagShopifyOrder(order.shopifyId, 'wa-no-response');
-  await sendWA(phone,
-    `تم تعليق طلبك #${order.orderNo} مؤقتاً لعدم الرد.\n` +
-    `للتواصل معنا: https://wa.me/201004444558`
-  );
+  console.log(`⏰ Order #${order.orderNo} for ${phone} — no reply after 3h, tagged wa-no-response in Shopify`);
+
   delete pendingOrders[phone];
   saveJSON(PENDING_FILE, pendingOrders);
 }
