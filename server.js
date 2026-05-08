@@ -503,10 +503,12 @@ async function shopifyRefund(shopifyOrderId) {
 // ================================================================
 // META WHATSAPP CLOUD API — send message
 // ================================================================
+const WA_API_VER = 'v22.0';
+
 async function sendWA(phone, message) {
   try {
     const r = await fetch(
-      `https://graph.facebook.com/v19.0/${META_PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/messages`,
       {
         method:  'POST',
         headers: {
@@ -523,12 +525,17 @@ async function sendWA(phone, message) {
     );
     const data = await r.json();
     if (data.error) {
-      console.error(`❌ WA send error to ${phone}:`, data.error.message);
+      const code = data.error.code || '?';
+      const msg  = data.error.message || JSON.stringify(data.error);
+      console.error(`❌ WA send error to ${phone} [code ${code}]: ${msg}`);
+      return { ok: false, code, error: msg };
     } else {
-      console.log(`✅ WA sent to ${phone}: ${message.substring(0, 60)}...`);
+      console.log(`✅ WA sent to ${phone} msgId:${data.messages?.[0]?.id}`);
+      return { ok: true };
     }
   } catch(e) {
     console.error('sendWA error:', e.message);
+    return { ok: false, error: e.message };
   }
 }
 
@@ -544,7 +551,7 @@ async function sendWATemplate(phone, templateName, languageCode, params) {
     }] : [];
 
     const r = await fetch(
-      `https://graph.facebook.com/v19.0/${META_PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/messages`,
       {
         method:  'POST',
         headers: {
@@ -565,7 +572,7 @@ async function sendWATemplate(phone, templateName, languageCode, params) {
     );
     const data = await r.json();
     if (data.error) {
-      console.error(`❌ WA template error to ${phone}:`, JSON.stringify(data.error));
+      console.error(`❌ WA template error to ${phone} [code ${data.error.code}]:`, JSON.stringify(data.error));
     } else {
       console.log(`✅ WA template "${templateName}" sent to ${phone}`);
     }
@@ -665,6 +672,99 @@ app.get('/admin/test-abandoned', async (req, res) => {
   ]);
   console.log(`🧪 Test abandoned template sent to ${phone}`);
   res.json({ sent: true, to: phone });
+});
+
+// ================================================================
+// ADMIN — Test WhatsApp sending
+// GET /admin/test-wa?phone=201XXXXXXXXX
+// ================================================================
+app.get('/admin/test-wa', async (req, res) => {
+  const phone = req.query.phone;
+  const msg   = req.query.msg || 'اختبار ✅ النظام يعمل بشكل صحيح';
+  const lines = [];
+
+  lines.push(`API version          : ${WA_API_VER}`);
+  lines.push(`META_PHONE_NUMBER_ID : ${META_PHONE_NUMBER_ID ? `✅ ${META_PHONE_NUMBER_ID}` : '❌ MISSING'}`);
+  lines.push(`META_ACCESS_TOKEN    : ${META_ACCESS_TOKEN ? `✅ set (length ${META_ACCESS_TOKEN.length})` : '❌ MISSING'}`);
+  lines.push('');
+
+  if (!phone) {
+    lines.push('⚠️  Add ?phone=201XXXXXXXXX to send a test message');
+    return res.send('<pre>' + lines.join('\n') + '</pre>');
+  }
+
+  lines.push(`Sending to : ${phone}`);
+  lines.push(`Message    : ${msg}`);
+  lines.push('---');
+
+  const r = await fetch(
+    `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/messages`,
+    {
+      method:  'POST',
+      headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: msg } })
+    }
+  );
+  const data = await r.json();
+
+  if (data.error) {
+    const code = data.error.code;
+    lines.push(`❌ Error [${code}]: ${data.error.message}`);
+    if (code === 190 || String(code) === '190')
+      lines.push('\n→ TOKEN EXPIRED. Go to Meta for Developers → App → WhatsApp → API Setup → Generate new token\n  Then update META_ACCESS_TOKEN in Railway env vars.');
+    else if (code === 131030)
+      lines.push('\n→ TEMPLATE REQUIRED for this type of message. Create & approve a template in Meta Business Manager.');
+    else if (code === 131047)
+      lines.push('\n→ 24-HOUR WINDOW: this number hasn\'t messaged you recently. Templates required for cold outreach.');
+    else if (code === 100)
+      lines.push('\n→ INVALID param — check META_PHONE_NUMBER_ID is correct.');
+  } else {
+    lines.push(`✅ SUCCESS! Message ID: ${data.messages?.[0]?.id}`);
+  }
+
+  res.send('<pre>' + lines.join('\n') + '</pre>');
+});
+
+// ================================================================
+// ADMIN — Check WhatsApp token validity
+// GET /admin/wa-status
+// ================================================================
+app.get('/admin/wa-status', async (req, res) => {
+  const lines = [];
+  lines.push(`Server time          : ${new Date().toISOString()}`);
+  lines.push(`API version          : ${WA_API_VER}`);
+  lines.push(`META_PHONE_NUMBER_ID : ${META_PHONE_NUMBER_ID || '❌ MISSING'}`);
+  lines.push(`META_ACCESS_TOKEN    : ${META_ACCESS_TOKEN ? `set (${META_ACCESS_TOKEN.length} chars)` : '❌ MISSING'}`);
+  lines.push('');
+
+  if (META_ACCESS_TOKEN) {
+    try {
+      const r = await fetch(
+        `https://graph.facebook.com/debug_token?input_token=${META_ACCESS_TOKEN}&access_token=${META_ACCESS_TOKEN}`
+      );
+      const d = await r.json();
+      if (d?.data) {
+        const exp   = d.data.expires_at ? new Date(d.data.expires_at * 1000).toISOString() : 'never (permanent)';
+        const valid = d.data.is_valid ? '✅ VALID' : '❌ INVALID / EXPIRED';
+        lines.push(`Token status  : ${valid}`);
+        lines.push(`Token type    : ${d.data.type || 'unknown'}`);
+        lines.push(`Expires       : ${exp}`);
+        lines.push(`Scopes        : ${(d.data.scopes || []).join(', ') || 'none listed'}`);
+        if (!d.data.is_valid) {
+          lines.push('');
+          lines.push('→ TOKEN IS EXPIRED. Fix:');
+          lines.push('  Meta for Developers → App → WhatsApp → API Setup → Generate new token');
+          lines.push('  Update META_ACCESS_TOKEN in Railway environment variables');
+        }
+      } else {
+        lines.push(`Token debug result: ${JSON.stringify(d)}`);
+      }
+    } catch(e) {
+      lines.push(`Token check error: ${e.message}`);
+    }
+  }
+
+  res.send('<pre>' + lines.join('\n') + '</pre>');
 });
 
 // ================================================================
