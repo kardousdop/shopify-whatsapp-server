@@ -201,7 +201,7 @@ app.post('/webhook/checkout', async (req, res) => {
     15 * 60 * 1000  // 15 min
   );
 
-  console.log(`🛒 Abandoned checkout saved for ${phone} — reminder in 1 hour`);
+  console.log(`🛒 Abandoned checkout saved for ${phone} — reminder in 15 minutes`);
 });
 
 // ── Send the actual abandoned checkout WhatsApp ─────────────────
