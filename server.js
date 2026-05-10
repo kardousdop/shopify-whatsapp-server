@@ -346,19 +346,28 @@ async function retryIfNoReply(phone) {
     `إذا لم نتلقَ ردًا، سيتم تعليق الطلب تلقائياً.`
   );
 
-  setTimeout(() => holdIfNoReply(phone), 2 * 60 * 60 * 1000);
+  setTimeout(() => autoConfirmIfNoReply(phone), 3 * 60 * 60 * 1000);
 }
 
-async function holdIfNoReply(phone) {
+async function autoConfirmIfNoReply(phone) {
   const order = pendingOrders[phone];
   if (!order || order.confirmed || order.cancelled) return;
 
-  await tagOdooOrder(order.shopifyId, 'wa-no-response');
-  await tagShopifyOrder(order.shopifyId, 'COD-Pending');
+  // Auto-confirm after 4 hours of no reply
+  order.confirmed = true;
+  saveJSON(PENDING_FILE, pendingOrders);
+
+  console.log(`⏰ Auto-confirming order #${order.orderNo} for ${phone} — no reply in 4 hours`);
+
   await sendWA(phone,
-    `تم تعليق طلبك #${order.orderNo} مؤقتاً لعدم الرد.\n` +
-    `للتواصل معنا: https://wa.me/201004444558`
+    `تم تأكيد طلبك #${order.orderNo} تلقائياً ✅\n\n` +
+    `سيتم التجهيز والشحن قريباً 🚚\n\n` +
+    `شكراً لثقتك في myMayz 🙏`
   );
+
+  await tagOdooOrder(order.shopifyId, 'wa-confirmed');
+  await tagShopifyOrder(order.shopifyId, 'COD-Confirmed');
+
   delete pendingOrders[phone];
   saveJSON(PENDING_FILE, pendingOrders);
 }
