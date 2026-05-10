@@ -645,9 +645,10 @@ app.get('/admin/pending', (req, res) => {
 });
 
 // ================================================================
-// ADMIN — BULK SEND  ← NEW
+// ADMIN — BULK SEND
 // POST /admin/bulk-send
-// Body: { "orders": [ { "phone", "firstName", "name", "total", "items" } ] }
+// Body: { "orders": [ { "phone", "firstName", "name", "shopifyId", "total", "items", "isCOD" } ] }
+// Registers each order into pendingOrders so replies are tracked properly
 // ================================================================
 app.post('/admin/bulk-send', async (req, res) => {
   const orders = req.body.orders || [];
@@ -658,6 +659,7 @@ app.post('/admin/bulk-send', async (req, res) => {
 
   for (const o of orders) {
     if (!o.phone) { failed++; errors.push(`${o.name}: no phone`); continue; }
+
     const msg =
       `مرحباً ${o.firstName || 'عميلنا'}! 👋\n\n` +
       `شكراً لطلبك من myMayz 🎉\n\n` +
@@ -667,16 +669,38 @@ app.post('/admin/bulk-send', async (req, res) => {
       `يرجى تأكيد طلبك الآن:\n` +
       `✅ اكتب *1* للتأكيد\n` +
       `❌ اكتب *2* للإلغاء`;
+
     try {
       await sendWA(o.phone, msg);
+
+      // Register in pendingOrders so replies are tracked
+      pendingOrders[o.phone] = {
+        orderNo:   o.name,
+        shopifyId: String(o.shopifyId || ''),
+        name:      o.firstName || 'عميلنا',
+        total:     o.total,
+        isCOD:     o.isCOD !== false, // default true for bulk
+        gateway:   'cash_on_delivery',
+        sentAt:    Date.now(),
+        retried:   false,
+        confirmed: false,
+        cancelled: false
+      };
+      saveJSON(PENDING_FILE, pendingOrders);
+
+      // Set retry timer (1 hour)
+      setTimeout(() => retryIfNoReply(o.phone), 60 * 60 * 1000);
+
+      console.log(`✅ Bulk sent + registered: ${o.name} → ${o.phone}`);
       sent++;
     } catch(e) {
       failed++;
       errors.push(`${o.name}: ${e.message}`);
     }
-    await new Promise(r => setTimeout(r, 350)); // rate limit delay
+    await new Promise(r => setTimeout(r, 350));
   }
 
+  saveJSON(PENDING_FILE, pendingOrders);
   console.log(`📤 Bulk send done: ${sent} sent, ${failed} failed`);
   res.json({ sent, failed, errors });
 });
