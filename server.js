@@ -1,13 +1,12 @@
 // ================================================================
 // shopify-whatsapp-server — server.js
 // Features:
-//   ✅ Order confirmation via WhatsApp template (COD + Card)
-//   ✅ Customer taps Confirm/Cancel button on WhatsApp
-//   ✅ Confirm → Shopify tagged wa-confirmed
-//   ✅ Cancel → Odoo cancelled + Shopify tagged wa-cancelled
-//   ✅ No reply after 3h → Shopify tagged wa-no-response
-//   ✅ Abandoned checkout WhatsApp reminder (15 min)
-//   ✅ Meta WhatsApp Cloud API (permanent token, v22.0)
+//   ✅ Order confirmation (COD + Card)
+//   ✅ Odoo cancel on customer reply
+//   ✅ Auto-confirm overdue orders
+//   ✅ Abandoned checkout WhatsApp reminder
+//   ✅ Meta WhatsApp Cloud API
+//   ✅ Odoo tagging (COD-Confirmed / COD-Cancelled / COD-Pending)
 //   ✅ Bulk send endpoint for manual campaigns
 // ================================================================
 
@@ -124,7 +123,6 @@ app.post('/webhook/order-created', async (req, res) => {
     shopifyId: String(o.id),
     name,
     total:     o.total_price,
-    items,
     isCOD,
     gateway:   o.payment_gateway,
     sentAt:    Date.now(),
@@ -134,15 +132,18 @@ app.post('/webhook/order-created', async (req, res) => {
   };
   saveJSON(PENDING_FILE, pendingOrders);
 
-  const payInfo = isCOD
-    ? `${o.total_price} EGP - الدفع عند الاستلام`
-    : `${o.total_price} EGP - تم الدفع بالبطاقة`;
+  const payNote = isCOD ? '💵 الدفع عند الاستلام' : '💳 تم الدفع بالبطاقة';
 
-  await sendWATemplate(phone, 'sf_cod_confirmation_1773577120326', 'ar', [
-    name,
-    `#${o.order_number}`,
-    payInfo
-  ]);
+  await sendWA(phone,
+    `مرحباً ${name}! 👋\n\n` +
+    `شكراً لطلبك من myMayz 🎉\n\n` +
+    `📦 رقم الطلب: #${o.order_number}\n` +
+    `${payNote} — ${o.total_price} EGP\n` +
+    `🛍️ ${items}\n\n` +
+    `يرجى تأكيد طلبك الآن:\n` +
+    `✅ اكتب *1* للتأكيد\n` +
+    `❌ اكتب *2* للإلغاء`
+  );
 
   setTimeout(() => retryIfNoReply(phone), 60 * 60 * 1000);
 });
@@ -202,7 +203,7 @@ app.post('/webhook/checkout', async (req, res) => {
     15 * 60 * 1000  // 15 min
   );
 
-  console.log(`🛒 Abandoned checkout saved for ${phone} — reminder in 15 minutes`);
+  console.log(`🛒 Abandoned checkout saved for ${phone} — reminder in 1 hour`);
 });
 
 // ── Send the actual abandoned checkout WhatsApp ─────────────────
@@ -263,44 +264,65 @@ app.post('/webhook/whatsapp', async (req, res) => {
   const value   = changes?.value;
   if (!value?.messages) return;
 
-  const msg  = value.messages[0];
-  const from = normalisePhone(msg.from);
+  const msg   = value.messages[0];
+  const from  = normalisePhone(msg.from);
+  const reply = (msg.text?.body || '').trim();
 
-  // Support both typed replies (1/2) and Quick Reply button taps
-  const textReply   = (msg.text?.body || '').trim().toLowerCase();
-  const buttonReply = (msg.button?.payload || msg.button?.text || '').trim().toLowerCase();
-  const isConfirm   = textReply === '1' || buttonReply.includes('confirm');
-  const isCancel    = textReply === '2' || buttonReply.includes('cancel');
-
-  console.log(`💬 WA reply from ${from}: text="${textReply}" button="${buttonReply}"`);
+  console.log(`💬 WA reply from ${from}: "${reply}"`);
 
   const order = pendingOrders[from];
   if (!order) return;
 
-  if (isConfirm) {
+  if (reply === '1') {
     order.confirmed = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
-    await tagShopifyOrder(order.shopifyId, 'wa-confirmed');
     await sendWA(from,
       `✅ تم تأكيد طلبك #${order.orderNo} بنجاح!\n` +
       `سيتم التجهيز والشحن قريباً 🎉\n\n` +
       `شكراً لثقتك في myMayz 🙏`
     );
 
+    await tagOdooOrder(order.shopifyId, 'wa-confirmed');
+    await tagShopifyOrder(order.shopifyId, 'COD-Confirmed');
     delete pendingOrders[from];
     saveJSON(PENDING_FILE, pendingOrders);
 
-  } else if (isCancel) {
+  } else if (reply === '2') {
     order.cancelled = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
-    await odooCancel(order.shopifyId);
-    await tagShopifyOrder(order.shopifyId, 'wa-cancelled');
-    await sendWA(from,
-      `تم إلغاء طلبك #${order.orderNo} ✅\n` +
-      `يمكنك الطلب مرة أخرى في أي وقت 🙏`
-    );
+    if (order.isCOD) {
+      const ok = await odooCancel(order.shopifyId);
+      await sendWA(from,
+        ok
+          ? `تم إلغاء طلبك #${order.orderNo} ✅\n` +
+            `لا توجد مبالغ محصلة (الدفع عند الاستلام).\n` +
+            `يمكنك الطلب مرة أخرى في أي وقت 🙏`
+          : `تم استلام طلب الإلغاء.\nسيتم المعالجة خلال 24 ساعة 🙏`
+      );
+      await tagOdooOrder(order.shopifyId, 'wa-cancelled');
+      await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
+    } else {
+      const [odooOk, refund] = await Promise.all([
+        odooCancel(order.shopifyId),
+        shopifyRefund(order.shopifyId)
+      ]);
+      if (odooOk && refund.success) {
+        await sendWA(from,
+          `تم إلغاء طلبك #${order.orderNo} ✅\n\n` +
+          `💳 سيتم استرداد ${refund.amount} EGP تلقائياً\n` +
+          `⏱️ خلال 3–7 أيام عمل حسب بنكك 🙏`
+        );
+      } else {
+        await sendWA(from,
+          `تم إلغاء طلبك #${order.orderNo} ✅\n` +
+          `⚠️ سيتم معالجة الاسترداد يدوياً خلال 24 ساعة 🙏`
+        );
+      }
+      await tagOdooOrder(order.shopifyId, 'wa-cancelled');
+      await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
+    }
 
     delete pendingOrders[from];
     saveJSON(PENDING_FILE, pendingOrders);
@@ -317,15 +339,12 @@ async function retryIfNoReply(phone) {
   order.retried = true;
   saveJSON(PENDING_FILE, pendingOrders);
 
-  const retryPayInfo = order.isCOD
-    ? `${order.total} EGP - الدفع عند الاستلام`
-    : `${order.total} EGP - تم الدفع بالبطاقة`;
-
-  await sendWATemplate(phone, 'sf_cod_confirmation_1773577120326', 'ar', [
-    order.name,
-    `#${order.orderNo}`,
-    retryPayInfo
-  ]);
+  await sendWA(phone,
+    `مرحباً! لاحظنا أنك لم تؤكد طلبك #${order.orderNo} بعد ⏰\n\n` +
+    `✅ رد *1* للتأكيد\n` +
+    `❌ رد *2* للإلغاء\n\n` +
+    `إذا لم نتلقَ ردًا، سيتم تعليق الطلب تلقائياً.`
+  );
 
   setTimeout(() => holdIfNoReply(phone), 2 * 60 * 60 * 1000);
 }
@@ -334,11 +353,12 @@ async function holdIfNoReply(phone) {
   const order = pendingOrders[phone];
   if (!order || order.confirmed || order.cancelled) return;
 
-  // Tag in Shopify only — can't send free-form WhatsApp since customer
-  // never replied (24h window closed), and we have no approved template for this
-  await tagShopifyOrder(order.shopifyId, 'wa-no-response');
-  console.log(`⏰ Order #${order.orderNo} for ${phone} — no reply after 3h, tagged wa-no-response in Shopify`);
-
+  await tagOdooOrder(order.shopifyId, 'wa-no-response');
+  await tagShopifyOrder(order.shopifyId, 'COD-Pending');
+  await sendWA(phone,
+    `تم تعليق طلبك #${order.orderNo} مؤقتاً لعدم الرد.\n` +
+    `للتواصل معنا: https://wa.me/201004444558`
+  );
   delete pendingOrders[phone];
   saveJSON(PENDING_FILE, pendingOrders);
 }
@@ -445,35 +465,6 @@ async function tagOdooOrder(shopifyOrderId, tagName) {
 }
 
 // ================================================================
-// SHOPIFY TAGGING
-// ================================================================
-async function tagShopifyOrder(shopifyOrderId, newTag) {
-  try {
-    const base    = `https://${SHOPIFY_STORE_URL}/admin/api/2024-01/orders/${shopifyOrderId}.json`;
-    const headers = { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' };
-
-    // Get current tags
-    const res  = await fetch(base, { headers });
-    const data = await res.json();
-    const currentTags = data.order?.tags || '';
-
-    // Append new tag (avoid duplicates)
-    const tagList = currentTags ? currentTags.split(',').map(t => t.trim()) : [];
-    if (!tagList.includes(newTag)) tagList.push(newTag);
-
-    await fetch(base, {
-      method: 'PUT',
-      headers,
-      body: JSON.stringify({ order: { id: shopifyOrderId, tags: tagList.join(', ') } })
-    });
-
-    console.log(`🏷️  Shopify: tagged order ${shopifyOrderId} with "${newTag}" ✅`);
-  } catch(e) {
-    console.error('Shopify tag error:', e.message);
-  }
-}
-
-// ================================================================
 // SHOPIFY REFUND API (card payments)
 // ================================================================
 async function shopifyRefund(shopifyOrderId) {
@@ -513,15 +504,42 @@ async function shopifyRefund(shopifyOrderId) {
   }
 }
 
+
+// ================================================================
+// SHOPIFY ORDER TAGGING
+// ================================================================
+async function tagShopifyOrder(shopifyOrderId, tag) {
+  try {
+    const base = `https://${SHOPIFY_STORE_URL}/admin/api/2024-01/orders/${shopifyOrderId}`;
+    const headers = { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' };
+    
+    // Get current tags first
+    const r = await fetch(`${base}.json?fields=id,tags`, { headers });
+    const data = await r.json();
+    const currentTags = data.order?.tags || '';
+    const tagsList = currentTags.split(',').map(t => t.trim()).filter(t => t);
+    
+    if (!tagsList.includes(tag)) {
+      tagsList.push(tag);
+      await fetch(`${base}.json`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({ order: { id: shopifyOrderId, tags: tagsList.join(', ') } })
+      });
+      console.log(`🏷️  Shopify: tagged order ${shopifyOrderId} with "${tag}" ✅`);
+    }
+  } catch(e) {
+    console.error('Shopify tag error:', e.message);
+  }
+}
+
 // ================================================================
 // META WHATSAPP CLOUD API — send message
 // ================================================================
-const WA_API_VER = 'v22.0';
-
 async function sendWA(phone, message) {
   try {
     const r = await fetch(
-      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/v19.0/${META_PHONE_NUMBER_ID}/messages`,
       {
         method:  'POST',
         headers: {
@@ -538,17 +556,12 @@ async function sendWA(phone, message) {
     );
     const data = await r.json();
     if (data.error) {
-      const code = data.error.code || '?';
-      const msg  = data.error.message || JSON.stringify(data.error);
-      console.error(`❌ WA send error to ${phone} [code ${code}]: ${msg}`);
-      return { ok: false, code, error: msg };
+      console.error(`❌ WA send error to ${phone}:`, data.error.message);
     } else {
-      console.log(`✅ WA sent to ${phone} msgId:${data.messages?.[0]?.id}`);
-      return { ok: true };
+      console.log(`✅ WA sent to ${phone}: ${message.substring(0, 60)}...`);
     }
   } catch(e) {
     console.error('sendWA error:', e.message);
-    return { ok: false, error: e.message };
   }
 }
 
@@ -564,7 +577,7 @@ async function sendWATemplate(phone, templateName, languageCode, params) {
     }] : [];
 
     const r = await fetch(
-      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/v19.0/${META_PHONE_NUMBER_ID}/messages`,
       {
         method:  'POST',
         headers: {
@@ -585,7 +598,7 @@ async function sendWATemplate(phone, templateName, languageCode, params) {
     );
     const data = await r.json();
     if (data.error) {
-      console.error(`❌ WA template error to ${phone} [code ${data.error.code}]:`, JSON.stringify(data.error));
+      console.error(`❌ WA template error to ${phone}:`, JSON.stringify(data.error));
     } else {
       console.log(`✅ WA template "${templateName}" sent to ${phone}`);
     }
@@ -645,12 +658,17 @@ app.post('/admin/bulk-send', async (req, res) => {
 
   for (const o of orders) {
     if (!o.phone) { failed++; errors.push(`${o.name}: no phone`); continue; }
+    const msg =
+      `مرحباً ${o.firstName || 'عميلنا'}! 👋\n\n` +
+      `شكراً لطلبك من myMayz 🎉\n\n` +
+      `📦 رقم الطلب: ${o.name}\n` +
+      `💵 المبلغ عند الاستلام: ${o.total} EGP\n` +
+      `🛍️ ${o.items}\n\n` +
+      `يرجى تأكيد طلبك الآن:\n` +
+      `✅ اكتب *1* للتأكيد\n` +
+      `❌ اكتب *2* للإلغاء`;
     try {
-      await sendWATemplate(o.phone, 'sf_cod_confirmation_1773577120326', 'ar', [
-        o.firstName || 'عميلنا',
-        o.name,
-        `${o.total} EGP - الدفع عند الاستلام`
-      ]);
+      await sendWA(o.phone, msg);
       sent++;
     } catch(e) {
       failed++;
@@ -680,234 +698,6 @@ app.get('/admin/test-abandoned', async (req, res) => {
   ]);
   console.log(`🧪 Test abandoned template sent to ${phone}`);
   res.json({ sent: true, to: phone });
-});
-
-// ================================================================
-// ADMIN — Deep phone number diagnostics
-// GET /admin/phone-check
-// ================================================================
-app.get('/admin/phone-check', async (req, res) => {
-  const lines = [];
-  lines.push(`=== WhatsApp Phone Number Deep Check ===`);
-  lines.push(`META_PHONE_NUMBER_ID : ${META_PHONE_NUMBER_ID}`);
-  lines.push('');
-
-  // 0. Check WABA status
-  try {
-    const r0 = await fetch(
-      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}?fields=account_mode,certificate,code_verification_status,display_phone_number,quality_rating,status,name_status,new_name_status,decision,requested_verified_name`,
-      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
-    );
-    const d0 = await r0.json();
-    if (!d0.error) {
-      lines.push(`Account mode         : ${d0.account_mode || 'N/A'}`);
-      lines.push(`Name status          : ${d0.name_status || 'N/A'}`);
-      lines.push(`Code verify status   : ${d0.code_verification_status || 'N/A'}`);
-      lines.push(`Decision             : ${d0.decision || 'N/A'}`);
-      lines.push('');
-
-      if (d0.account_mode === 'SANDBOX') {
-        lines.push('⚠️  ACCOUNT IS IN SANDBOX MODE!');
-        lines.push('   In sandbox mode, messages can only be sent to numbers you explicitly added');
-        lines.push('   as test numbers in the Meta developer console.');
-        lines.push('   → You must switch to LIVE mode to send to real customers.');
-        lines.push('');
-      }
-    }
-  } catch(e) {}
-
-
-  try {
-    // 1. Get phone number details from Meta
-    const r1 = await fetch(
-      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}?fields=display_phone_number,verified_name,quality_rating,status,platform_type,throughput`,
-      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
-    );
-    const phone = await r1.json();
-    if (phone.error) {
-      lines.push(`❌ Phone number lookup error: ${phone.error.message}`);
-    } else {
-      lines.push(`Display number   : ${phone.display_phone_number || 'N/A'}`);
-      lines.push(`Verified name    : ${phone.verified_name || 'N/A'}`);
-      lines.push(`Status           : ${phone.status || 'N/A'}`);
-      lines.push(`Quality rating   : ${phone.quality_rating || 'N/A'}`);
-      lines.push(`Platform type    : ${phone.platform_type || 'N/A'}`);
-      lines.push(`Throughput tier  : ${phone.throughput?.max_daily_conversation_per_phone || 'N/A'}`);
-
-      if (phone.status !== 'CONNECTED') {
-        lines.push('');
-        lines.push(`⚠️  STATUS IS NOT "CONNECTED" — this is why messages are not delivered!`);
-        lines.push(`   Status "${phone.status}" means the number is not active/connected.`);
-      } else {
-        lines.push('');
-        lines.push(`✅ Phone number is CONNECTED and active`);
-      }
-    }
-  } catch(e) {
-    lines.push(`❌ Error: ${e.message}`);
-  }
-
-  lines.push('');
-
-  try {
-    // 2. Check WABA (WhatsApp Business Account) details
-    const r2 = await fetch(
-      `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/whatsapp_business_profile?fields=about,address,description,email,profile_picture_url,websites,vertical`,
-      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
-    );
-    const profile = await r2.json();
-    if (profile.error) {
-      lines.push(`Business profile error: ${profile.error.message}`);
-    } else {
-      lines.push(`Business about   : ${profile.data?.[0]?.about || 'N/A'}`);
-    }
-  } catch(e) {
-    lines.push(`Profile check error: ${e.message}`);
-  }
-
-  res.send('<pre>' + lines.join('\n') + '</pre>');
-});
-
-// ================================================================
-// ADMIN — Send + immediately check delivery status
-// GET /admin/delivery-test?phone=201XXXXXXXXX
-// ================================================================
-app.get('/admin/delivery-test', async (req, res) => {
-  const phone = req.query.phone;
-  if (!phone) return res.send('<pre>Add ?phone=201XXXXXXXXX</pre>');
-  const lines = [];
-  lines.push(`Sending to: ${phone}`);
-
-  // Send message
-  const sr = await fetch(
-    `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/messages`,
-    {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: 'اختبار توصيل ✅' } })
-    }
-  );
-  const sd = await sr.json();
-  if (sd.error) {
-    lines.push(`❌ Send error [${sd.error.code}]: ${sd.error.message}`);
-    return res.send('<pre>' + lines.join('\n') + '</pre>');
-  }
-  const msgId = sd.messages?.[0]?.id;
-  lines.push(`✅ Sent — message ID: ${msgId}`);
-  lines.push('Waiting 3 seconds then checking delivery status...');
-
-  // Wait 3s then check status
-  await new Promise(r => setTimeout(r, 3000));
-  try {
-    const cr = await fetch(
-      `https://graph.facebook.com/${WA_API_VER}/${msgId}?fields=id,status,timestamp,errors`,
-      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
-    );
-    const cd = await cr.json();
-    if (cd.error) {
-      lines.push(`Status check error: ${cd.error.message}`);
-      lines.push('(This is normal — message status may not be queryable directly)');
-    } else {
-      lines.push(`Message status: ${JSON.stringify(cd)}`);
-    }
-  } catch(e) {
-    lines.push(`Status check failed: ${e.message}`);
-  }
-
-  res.send('<pre>' + lines.join('\n') + '</pre>');
-});
-
-// ================================================================
-// ADMIN — Test WhatsApp sending
-// GET /admin/test-wa?phone=201XXXXXXXXX
-// ================================================================
-app.get('/admin/test-wa', async (req, res) => {
-  const phone = req.query.phone;
-  const msg   = req.query.msg || 'اختبار ✅ النظام يعمل بشكل صحيح';
-  const lines = [];
-
-  lines.push(`API version          : ${WA_API_VER}`);
-  lines.push(`META_PHONE_NUMBER_ID : ${META_PHONE_NUMBER_ID ? `✅ ${META_PHONE_NUMBER_ID}` : '❌ MISSING'}`);
-  lines.push(`META_ACCESS_TOKEN    : ${META_ACCESS_TOKEN ? `✅ set (length ${META_ACCESS_TOKEN.length})` : '❌ MISSING'}`);
-  lines.push('');
-
-  if (!phone) {
-    lines.push('⚠️  Add ?phone=201XXXXXXXXX to send a test message');
-    return res.send('<pre>' + lines.join('\n') + '</pre>');
-  }
-
-  lines.push(`Sending to : ${phone}`);
-  lines.push(`Message    : ${msg}`);
-  lines.push('---');
-
-  const r = await fetch(
-    `https://graph.facebook.com/${WA_API_VER}/${META_PHONE_NUMBER_ID}/messages`,
-    {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: msg } })
-    }
-  );
-  const data = await r.json();
-
-  if (data.error) {
-    const code = data.error.code;
-    lines.push(`❌ Error [${code}]: ${data.error.message}`);
-    if (code === 190 || String(code) === '190')
-      lines.push('\n→ TOKEN EXPIRED. Go to Meta for Developers → App → WhatsApp → API Setup → Generate new token\n  Then update META_ACCESS_TOKEN in Railway env vars.');
-    else if (code === 131030)
-      lines.push('\n→ TEMPLATE REQUIRED for this type of message. Create & approve a template in Meta Business Manager.');
-    else if (code === 131047)
-      lines.push('\n→ 24-HOUR WINDOW: this number hasn\'t messaged you recently. Templates required for cold outreach.');
-    else if (code === 100)
-      lines.push('\n→ INVALID param — check META_PHONE_NUMBER_ID is correct.');
-  } else {
-    lines.push(`✅ SUCCESS! Message ID: ${data.messages?.[0]?.id}`);
-  }
-
-  res.send('<pre>' + lines.join('\n') + '</pre>');
-});
-
-// ================================================================
-// ADMIN — Check WhatsApp token validity
-// GET /admin/wa-status
-// ================================================================
-app.get('/admin/wa-status', async (req, res) => {
-  const lines = [];
-  lines.push(`Server time          : ${new Date().toISOString()}`);
-  lines.push(`API version          : ${WA_API_VER}`);
-  lines.push(`META_PHONE_NUMBER_ID : ${META_PHONE_NUMBER_ID || '❌ MISSING'}`);
-  lines.push(`META_ACCESS_TOKEN    : ${META_ACCESS_TOKEN ? `set (${META_ACCESS_TOKEN.length} chars)` : '❌ MISSING'}`);
-  lines.push('');
-
-  if (META_ACCESS_TOKEN) {
-    try {
-      const r = await fetch(
-        `https://graph.facebook.com/debug_token?input_token=${META_ACCESS_TOKEN}&access_token=${META_ACCESS_TOKEN}`
-      );
-      const d = await r.json();
-      if (d?.data) {
-        const exp   = d.data.expires_at ? new Date(d.data.expires_at * 1000).toISOString() : 'never (permanent)';
-        const valid = d.data.is_valid ? '✅ VALID' : '❌ INVALID / EXPIRED';
-        lines.push(`Token status  : ${valid}`);
-        lines.push(`Token type    : ${d.data.type || 'unknown'}`);
-        lines.push(`Expires       : ${exp}`);
-        lines.push(`Scopes        : ${(d.data.scopes || []).join(', ') || 'none listed'}`);
-        if (!d.data.is_valid) {
-          lines.push('');
-          lines.push('→ TOKEN IS EXPIRED. Fix:');
-          lines.push('  Meta for Developers → App → WhatsApp → API Setup → Generate new token');
-          lines.push('  Update META_ACCESS_TOKEN in Railway environment variables');
-        }
-      } else {
-        lines.push(`Token debug result: ${JSON.stringify(d)}`);
-      }
-    } catch(e) {
-      lines.push(`Token check error: ${e.message}`);
-    }
-  }
-
-  res.send('<pre>' + lines.join('\n') + '</pre>');
 });
 
 // ================================================================
