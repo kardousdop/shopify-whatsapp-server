@@ -16,6 +16,14 @@
 
 const express = require('express');
 const router  = express.Router();
+// ── CORS — allow requests from the returns portal ─────────────────────
+router.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-returns-secret');
+    if (req.method === 'OPTIONS') return res.status(200).end();
+    next();
+});
 
 // ── Config ────────────────────────────────────────────────────────────
 const PHONE_ID = process.env.META_PHONE_NUMBER_ID || '1091672370692388';
