@@ -163,6 +163,59 @@ router.get('/health', (req, res) => {
   });
 });
 
+
+// ── POST /returns/submit-templates (one-time admin — submit all 4 to Meta) ──
+const WABA_ID = '900960922811775';
+router.post('/submit-templates', async (req, res) => {
+  if (req.headers['x-returns-secret'] !== SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const TOKEN = process.env.META_ACCESS_TOKEN;
+  const defs = [
+    {
+      name: 'return_request_received',
+      text: 'مرحباً {{1}} 👋\n\nتم استلام طلب الإرجاع/الاستبدال الخاص بك بنجاح ✅\n\n📦 رقم الطلب: {{2}}\n🔖 رقم المرجع: {{3}}\n\nسنراجع طلبك ونتواصل معك قريباً في حال احتجنا أي معلومات إضافية.\n\n— فريق myMayz 🌿',
+      example: [['سارة', '#53760', 'REQ-ABC123']]
+    },
+    {
+      name: 'return_warehouse_received',
+      text: 'مرحباً {{1}} 👋\n\nوصل منتجك إلى مخزن myMayz بنجاح 📦✅\n\n📦 رقم الطلب: {{2}}\n\nجاري مراجعة حالة المنتج. سيتم معالجة طلبك خلال 1-2 يوم عمل.\n\n— فريق myMayz 🌿',
+      example: [['سارة', '#53760']]
+    },
+    {
+      name: 'return_awb_created',
+      text: 'مرحباً {{1}} 👋\n\nتم إنشاء بوليصة الشحن لاستلام منتجك 🚚\n\n📦 رقم الطلب: {{2}}\n📋 رقم البوليصة: {{3}}\n\nالمندوب سيتواصل معك قريباً لتحديد موعد الاستلام. يرجى تجهيز المنتج للتسليم.\n\n— فريق myMayz 🌿',
+      example: [['سارة', '#53760', '7891234']]
+    },
+    {
+      name: 'return_refund_processed',
+      text: 'مرحباً {{1}} 👋\n\nتمت معالجة استرداد مبلغك بنجاح 💰✅\n\n📦 رقم الطلب: {{2}}\n💵 المبلغ: {{3}}\n\nيرجى التحقق من حسابك. في حال عدم الاستلام خلال 24 ساعة تواصل معنا.\n\n— فريق myMayz 🌿',
+      example: [['سارة', '#53760', '1200 EGP']]
+    }
+  ];
+  const results = [];
+  for (const t of defs) {
+    try {
+      const r = await fetch('https://graph.facebook.com/v19.0/' + WABA_ID + '/message_templates', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: t.name,
+          language: 'ar',
+          category: 'UTILITY',
+          components: [{ type: 'BODY', text: t.text, example: { body_text: t.example } }]
+        })
+      });
+      const d = await r.json();
+      results.push({ name: t.name, ok: r.ok, data: d });
+    } catch (e) {
+      results.push({ name: t.name, ok: false, error: e.message });
+    }
+  }
+  return res.json({ submitted: results.length, results });
+});
+
+
 module.exports = router;
 
 // ════════════════════════════════════════════════════════════════════
