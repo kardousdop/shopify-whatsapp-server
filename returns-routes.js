@@ -163,8 +163,7 @@ router.get('/health', (req, res) => {
   });
 });
 
-
-// ── POST /returns/submit-templates (one-time admin — submit all 4 to Meta) ──
+// ── POST /returns/submit-templates (one-time admin) ───────────────────
 const WABA_ID = '900960922811775';
 router.post('/submit-templates', async (req, res) => {
   if (req.headers['x-returns-secret'] !== SECRET) {
@@ -215,98 +214,23 @@ router.post('/submit-templates', async (req, res) => {
   return res.json({ submitted: results.length, results });
 });
 
+// ── GET /returns/template-status ─────────────────────────────────────
+router.get('/template-status', async (req, res) => {
+  if (req.headers['x-returns-secret'] !== SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const r = await fetch(
+      'https://graph.facebook.com/v19.0/' + WABA_ID + '/message_templates?fields=name,status,language,category&limit=20',
+      { headers: { 'Authorization': 'Bearer ' + process.env.META_ACCESS_TOKEN } }
+    );
+    const d = await r.json();
+    const ourNames = Object.values(TEMPLATES);
+    const filtered = (d.data || []).filter(t => ourNames.includes(t.name));
+    return res.json({ templates: filtered, total: (d.data || []).length });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
 
 module.exports = router;
-
-// ════════════════════════════════════════════════════════════════════
-//  META TEMPLATE SUBMISSIONS
-//  Go to: Meta Business Manager -> WhatsApp -> Message Templates -> Create
-//  Category: UTILITY  |  Language: Arabic (ar)
-//  Account: WABA 900960922811775
-// ════════════════════════════════════════════════════════════════════
-
-/*
---------------------------------------------------
-TEMPLATE 1: return_request_received
---------------------------------------------------
-Name:     return_request_received
-Category: UTILITY
-Language: ar
-
-Body (Arabic):
-مرحباً {{1}} 👋
-
-تم استلام طلب الإرجاع/الاستبدال الخاص بك بنجاح ✅
-
-📦 رقم الطلب: {{2}}
-🔖 رقم المرجع: {{3}}
-
-سنراجع طلبك ونتواصل معك قريباً في حال احتجنا أي معلومات إضافية.
-
-— فريق myMayz 🌿
-
-Example values: {{1}}=سارة، {{2}}=#53760، {{3}}=REQ-ABC123
-
---------------------------------------------------
-TEMPLATE 2: return_warehouse_received
---------------------------------------------------
-Name:     return_warehouse_received
-Category: UTILITY
-Language: ar
-
-Body (Arabic):
-مرحباً {{1}} 👋
-
-وصل منتجك إلى مخزن myMayz بنجاح 📦✅
-
-📦 رقم الطلب: {{2}}
-
-جاري مراجعة حالة المنتج. سيتم معالجة طلبك خلال 1-2 يوم عمل.
-
-— فريق myMayz 🌿
-
-Example values: {{1}}=سارة، {{2}}=#53760
-
---------------------------------------------------
-TEMPLATE 3: return_awb_created
---------------------------------------------------
-Name:     return_awb_created
-Category: UTILITY
-Language: ar
-
-Body (Arabic):
-مرحباً {{1}} 👋
-
-تم إنشاء بوليصة الشحن لاستلام منتجك 🚚
-
-📦 رقم الطلب: {{2}}
-📋 رقم البوليصة: {{3}}
-
-المندوب سيتواصل معك قريباً لتحديد موعد الاستلام. يرجى تجهيز المنتج للتسليم.
-
-— فريق myMayz 🌿
-
-Example values: {{1}}=سارة، {{2}}=#53760، {{3}}=7891234
-
---------------------------------------------------
-TEMPLATE 4: return_refund_processed
---------------------------------------------------
-Name:     return_refund_processed
-Category: UTILITY
-Language: ar
-
-Body (Arabic):
-مرحباً {{1}} 👋
-
-تمت معالجة استرداد مبلغك بنجاح 💰✅
-
-📦 رقم الطلب: {{2}}
-💵 المبلغ: {{3}}
-
-يرجى التحقق من حسابك. في حال عدم الاستلام خلال 24 ساعة تواصل معنا.
-
-— فريق myMayz 🌿
-
-Example values: {{1}}=سارة، {{2}}=#53760، {{3}}=1200 EGP
---------------------------------------------------
-*/
