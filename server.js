@@ -13,6 +13,7 @@
 const express = require('express');
 const crypto  = require('crypto');
 const fs      = require('fs');
+const returnsRouter = require('./returns-routes');
 const app     = express();
 
 // ── Raw body needed for webhook signature verification ──────────
@@ -735,6 +736,7 @@ app.get('/admin/test-abandoned', async (req, res) => {
 
 // ================================================================
 // START
+app.use('/returns', returnsRouter);
 // ================================================================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
