@@ -306,14 +306,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
     saveJSON(PENDING_FILE, pendingOrders);
 
     if (order.isCOD) {
-      // COD — no charge to refund; team will cancel in Odoo manually
       await sendWATemplate(from, ORDER_TEMPLATES.cancelled_cod, 'ar', [
         order.name, String(order.orderNo)
       ]);
       await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
 
     } else {
-      // Card — attempt Shopify refund; team will cancel in Odoo manually
       const refund = await shopifyRefund(order.shopifyId);
       const refundInfo = refund.success
         ? `سيتم استرداد ${refund.amount} EGP تلقائياً خلال 3-7 أيام عمل حسب بنكك 🙏`
@@ -488,8 +486,6 @@ function normalisePhone(phone) {
 }
 
 function isCodOrder(order) {
-  // Only trust the payment gateway — do NOT use financial_status (it is 'pending'
-  // for a few seconds on card orders too, which would misclassify them as COD).
   return ['cash_on_delivery', 'cod', 'manual'].includes(
     (order.payment_gateway || '').toLowerCase()
   );
@@ -509,16 +505,14 @@ app.get('/', (req, res) => {
 });
 
 // ================================================================
-// ADMIN — list pending orders  (requires x-admin-secret header)
+// ADMIN — list pending orders
 // ================================================================
 app.get('/admin/pending', requireAdminAuth, (req, res) => {
   res.json(pendingOrders);
 });
 
 // ================================================================
-// ADMIN — BULK SEND  (requires x-admin-secret header)
-// POST /admin/bulk-send
-// Body: { "orders": [ { "phone", "firstName", "name", "shopifyId", "total", "items", "isCOD" } ] }
+// ADMIN — BULK SEND
 // ================================================================
 app.post('/admin/bulk-send', requireAdminAuth, async (req, res) => {
   const orders = req.body.orders || [];
@@ -587,10 +581,9 @@ app.get('/admin/test-abandoned', requireAdminAuth, async (req, res) => {
 });
 
 // ================================================================
-// SUBMIT ORDER TEMPLATES TO META  (requires x-admin-secret)
+// SUBMIT ORDER TEMPLATES TO META
 // GET /submit-order-templates?secret=...
-// Submits all 6 order templates for Meta review.
-// Run once — re-running is safe (Meta will reject duplicates gracefull==============================================================
+// ================================================================
 app.get('/submit-order-templates', requireAdminAuth, async (req, res) => {
   const url = `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates`;
   const headers = {
@@ -657,6 +650,121 @@ app.get('/submit-order-templates', requireAdminAuth, async (req, res) => {
   }
 
   res.json({ submitted: results.length, results });
+});
+
+// ================================================================
+// META WEBHOOK — delivery status callbacks (GET = verify, POST = events)
+// ================================================================
+app.get('/webhook/meta', (req, res) => {
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    console.log('✅ Meta webhook verified');
+    return res.status(200).send(challenge);
+  }
+  res.status(403).send('Forbidden');
+});
+
+app.post('/webhook/meta', (req, res) => {
+  res.status(200).send('ok');
+  const body = req.body;
+  try {
+    const changes  = body?.entry?.[0]?.changes?.[0]?.value;
+    const statuses = changes?.statuses;
+    if (statuses) {
+      for (const s of statuses) {
+        console.log(`📬 Meta delivery: id=${s.id} status=${s.status} to=${s.recipient_id}${s.errors ? ' errors='+JSON.stringify(s.errors) : ''}`);
+      }
+    }
+    const messages = changes?.messages;
+    if (messages) {
+      for (const m of messages) {
+        console.log(`📨 Meta inbound: from=${m.from} type=${m.type} text=${m.text?.body || ''}`);
+      }
+    }
+  } catch(e) {
+    console.error('Meta webhook parse error:', e.message);
+  }
+});
+
+// ================================================================
+// ADMIN — CHECK ALL TEMPLATES
+// GET /admin/all-templates?secret=...
+// ================================================================
+app.get('/admin/all-templates', requireAdminAuth, async (req, res) => {
+  try {
+    const r = await fetch(
+      `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates?fields=name,status,category,language&limit=50`,
+      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
+    );
+    const data = await r.json();
+    res.json(data);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ================================================================
+// SUBMIT ABANDONED CART TEMPLATE AS UTILITY
+// GET /submit-abandoned-template?secret=...
+// Deletes existing MARKETING version and re-submits as UTILITY.
+// ================================================================
+app.get('/submit-abandoned-template', requireAdminAuth, async (req, res) => {
+  const headers = {
+    'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
+    'Content-Type':  'application/json'
+  };
+
+  let deleteResult = null;
+  try {
+    const listR = await fetch(
+      `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates?name=abandoned_cart_reminder&fields=id,name,category,status`,
+      { headers }
+    );
+    const listData = await listR.json();
+    const existing = listData.data?.[0];
+    if (existing) {
+      console.log(`🗑️ Found existing "${existing.name}" [${existing.category}/${existing.status}] id=${existing.id} — deleting...`);
+      const delR = await fetch(
+        `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates?hsm_id=${existing.id}&name=abandoned_cart_reminder`,
+        { method: 'DELETE', headers }
+      );
+      deleteResult = await delR.json();
+      console.log(`🗑️ Delete result:`, JSON.stringify(deleteResult));
+      await new Promise(r => setTimeout(r, 2000));
+    } else {
+      console.log(`ℹ️ No existing "abandoned_cart_reminder" found — submitting fresh`);
+    }
+  } catch(e) {
+    console.warn('Delete step error:', e.message);
+  }
+
+  const body = 'مرحباً {{1}}! 🛒\n\nلاحظنا أنك تركت بعض المنتجات في سلة التسوق:\n🛍️ {{2}}\n💰 {{3}} EGP\n\nأكمل طلبك الآن قبل نفاد المخزون 👇\n{{4}}\n\n— فريق myMayz 🌿';
+  try {
+    const submitR = await fetch(
+      `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          name:     'abandoned_cart_reminder',
+          language: 'ar',
+          category: 'UTILITY',
+          components: [{
+            type: 'BODY',
+            text: body,
+            example: { body_text: [['أحمد', 'Alkaline Clay Water Bottle ×1', '784', 'https://mymayz.com']] }
+          }]
+        })
+      }
+    );
+    const submitData = await submitR.json();
+    console.log(`📋 Resubmit "abandoned_cart_reminder" as UTILITY: ${submitR.ok ? '✅' : '❌'} — ${JSON.stringify(submitData)}`);
+    res.json({ deleteResult, submitResult: submitData, ok: submitR.ok });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ================================================================
