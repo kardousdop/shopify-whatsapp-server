@@ -21,6 +21,15 @@ const { createClient } = require('@supabase/supabase-js');
 const returnsRouter = require('./returns-routes');
 const app = express();
 
+// ── CORS — allow browser requests from any origin ───────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,x-admin-secret');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // ── Raw body needed for webhook signature verification ──────────
 app.use((req, res, next) => {
   let data = '';
