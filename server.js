@@ -4,16 +4,17 @@
 // ✅ Order confirmation (COD + Card) — WhatsApp templates
 // ✅ Customer cancel reply via WhatsApp
 // ✅ Auto-confirm overdue orders
-// ✅ Abandoned checkout WhatsApp reminder
+// ✅ Abandoned checkout WhatsApp reminder — Supabase-backed queue
 // ✅ Meta WhatsApp Cloud API (templates only — no free-form)
 // ✅ Shopify order tagging (COD-Confirmed / Card-Confirmed / COD-Cancelled)
 // ✅ Bulk send endpoint for manual campaigns
-// ℹ️  Odoo integration removed — cancellations handled manually in Odoo
+// ℹ️ Odoo integration removed — cancellations handled manually in Odoo
 // ================================================================
 
 const express = require('express');
-const crypto  = require('crypto');
-const fs      = require('fs');
+const crypto = require('crypto');
+const fs = require('fs');
+const { createClient } = require('@supabase/supabase-js');
 const returnsRouter = require('./returns-routes');
 const app = express();
 
@@ -36,6 +37,8 @@ const {
   SHOPIFY_STORE_URL,
   SHOPIFY_ADMIN_TOKEN,
   SHOPIFY_WEBHOOK_SECRET,
+  SUPABASE_URL,
+  SUPABASE_KEY,
   ADMIN_SECRET = 'mymayz-admin-2024',
   PORT = 3000
 } = process.env;
@@ -44,44 +47,28 @@ const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'mymayz-verify-2024';
 // WhatsApp Business Account ID (for template submission)
 const WABA_ID = process.env.WABA_ID || '900960922811775';
 
+// ── Supabase client ──────────────────────────────────────────────
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
 // ── Order template names (must match approved Meta templates) ────
 const ORDER_TEMPLATES = {
-  confirmation:   'order_confirmation',    // params: name, order#, payNote, total, items
-  reminder:       'order_reminder',        // params: name, order#
-  auto_confirmed: 'order_autoconfirmed',   // params: name, order#
-  confirmed:      'order_confirmed',       // params: name, order#
-  cancelled_cod:  'order_cancelled_cod',   // params: name, order#
-  cancelled_card: 'order_cancelled_card',  // params: name, order#, refundInfo
+  confirmation:   'order_confirmation',   // params: name, order#, payNote, total, items
+  reminder:       'order_reminder',       // params: name, order#
+  auto_confirmed: 'order_autoconfirmed',  // params: name, order#
+  confirmed:      'order_confirmed',      // params: name, order#
+  cancelled_cod:  'order_cancelled_cod',  // params: name, order#
+  cancelled_card: 'order_cancelled_card', // params: name, order#, refundInfo
 };
 
-// ── Persistent storage for pending orders ───────────────────────
-const PENDING_FILE   = './pendingOrders.json';
-const ABANDONED_FILE = './abandonedCheckouts.json';
-
-let pendingOrders      = loadJSON(PENDING_FILE);
-let abandonedCheckouts = loadJSON(ABANDONED_FILE);
-let abandonedTimers    = {};
+// ── Persistent storage for pending orders (file-based, small + safe) ──
+const PENDING_FILE = './pendingOrders.json';
+let pendingOrders = loadJSON(PENDING_FILE);
 
 function loadJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
 }
 function saveJSON(file, data) {
   try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); } catch(e) { console.error('saveJSON error:', e.message); }
-}
-
-// ── Restore abandoned checkout timers on server restart ─────────
-function restoreAbandonedTimers() {
-  const now = Date.now();
-  let restored = 0;
-  for (const [token, checkout] of Object.entries(abandonedCheckouts)) {
-    if (!checkout.reminded && !checkout.completed) {
-      const elapsed = now - checkout.createdAt;
-      const delay   = Math.max(0, (15 * 60 * 1000) - elapsed);
-      abandonedTimers[token] = setTimeout(() => sendAbandonedReminder(token), delay);
-      restored++;
-    }
-  }
-  if (restored > 0) console.log(`♻️ Restored ${restored} abandoned checkout timer(s)`);
 }
 
 // ── Restore order confirmation timers on restart ─────────────────
@@ -91,7 +78,7 @@ function restoreOrderTimers() {
   for (const [phone, order] of Object.entries(pendingOrders)) {
     if (!order.confirmed && !order.cancelled) {
       const elapsed = now - order.sentAt;
-      const delay   = Math.max(0, (60 * 60 * 1000) - elapsed);
+      const delay = Math.max(0, (60 * 60 * 1000) - elapsed);
       setTimeout(() => retryIfNoReply(phone), delay);
       restored++;
     }
@@ -133,26 +120,27 @@ app.post('/webhook/order-created', async (req, res) => {
   if (!verifyShopifyWebhook(req)) return res.status(401).send('Unauthorized');
   res.status(200).send('ok');
 
-  const o     = req.body;
+  const o = req.body;
   const phone = normalisePhone(o.billing_address?.phone || o.shipping_address?.phone || o.customer?.phone);
   if (!phone) { console.log(`⚠️ No phone on order #${o.order_number}`); return; }
 
-  const isCOD  = isCodOrder(o);
-  const name   = o.customer?.first_name || 'عميلنا';
-  const items  = (o.line_items || []).map(i => `${i.name} ×${i.quantity}`).join('، ');
+  const isCOD = isCodOrder(o);
+  const name = o.customer?.first_name || 'عميلنا';
+  const items = (o.line_items || []).map(i => `${i.name} ×${i.quantity}`).join('، ');
   const payNote = isCOD ? 'الدفع عند الاستلام' : 'تم الدفع بالبطاقة';
 
-  cancelAbandonedTimerByPhone(phone);
+  // Cancel any pending abandoned checkout reminder for this phone
+  await cancelAbandonedTimerByPhone(phone);
 
   pendingOrders[phone] = {
-    orderNo:   o.order_number,
+    orderNo: o.order_number,
     shopifyId: String(o.id),
     name,
-    total:     o.total_price,
+    total: o.total_price,
     isCOD,
-    gateway:   o.payment_gateway,
-    sentAt:    Date.now(),
-    retried:   false,
+    gateway: o.payment_gateway,
+    sentAt: Date.now(),
+    retried: false,
     confirmed: false,
     cancelled: false
   };
@@ -166,14 +154,14 @@ app.post('/webhook/order-created', async (req, res) => {
 });
 
 // ================================================================
-// 2. SHOPIFY — ABANDONED CHECKOUT
+// 2. SHOPIFY — ABANDONED CHECKOUT  (Supabase-backed persistent queue)
 // ================================================================
 app.post('/webhook/checkout', async (req, res) => {
   if (!verifyShopifyWebhook(req)) return res.status(401).send('Unauthorized');
   res.status(200).send('ok');
 
   const checkout = req.body;
-  const phone    = normalisePhone(
+  const phone = normalisePhone(
     checkout.billing_address?.phone ||
     checkout.shipping_address?.phone ||
     checkout.phone
@@ -184,13 +172,9 @@ app.post('/webhook/checkout', async (req, res) => {
     return;
   }
 
+  // Skip if customer already has a pending confirmed order
   if (pendingOrders[phone]) {
     console.log(`ℹ️ Abandoned checkout for ${phone} — already has pending order, skipping`);
-    return;
-  }
-
-  if (abandonedCheckouts[checkout.token]?.reminded) {
-    console.log(`ℹ️ Abandoned checkout ${checkout.token} already reminded`);
     return;
   }
 
@@ -201,59 +185,108 @@ app.post('/webhook/checkout', async (req, res) => {
   const total = checkout.total_price || '0.00';
   const url   = checkout.abandoned_checkout_url || 'https://mymayz.com';
 
-  abandonedCheckouts[checkout.token] = {
-    phone, name, items, total, url,
-    createdAt: Date.now(),
-    reminded:  false,
-    completed: false
-  };
-  saveJSON(ABANDONED_FILE, abandonedCheckouts);
+  // Schedule reminder 15 minutes from now
+  const scheduledAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-  cancelAbandonedTimerByPhone(phone);
+  // Upsert into Supabase — if same token comes again, update scheduled_at only
+  const { error } = await supabase
+    .from('mm_abandoned_checkouts')
+    .upsert({
+      checkout_token: checkout.token,
+      phone,
+      cust_name: name,
+      items,
+      total,
+      checkout_url: url,
+      scheduled_at: scheduledAt,
+      sent: false,
+      sent_at: null
+    }, { onConflict: 'checkout_token' });
 
-  abandonedTimers[checkout.token] = setTimeout(
-    () => sendAbandonedReminder(checkout.token),
-    15 * 60 * 1000
-  );
-
-  console.log(`🛒 Abandoned checkout saved for ${phone} — reminder in 15 min`);
+  if (error) {
+    console.error('❌ Supabase upsert abandoned checkout error:', error.message);
+  } else {
+    console.log(`🛒 Abandoned checkout queued for ${phone} — reminder at ${scheduledAt}`);
+  }
 });
 
-// ── Send the actual abandoned checkout WhatsApp ─────────────────
-async function sendAbandonedReminder(token) {
-  const checkout = abandonedCheckouts[token];
-  if (!checkout || checkout.reminded || checkout.completed) return;
+// ================================================================
+// 3. CRON — SEND DUE ABANDONED CHECKOUT REMINDERS
+// GET /cron/send-abandoned?secret=mymayz-admin-2024
+// Call every 5 minutes via cron-job.org (free)
+// ================================================================
+app.get('/cron/send-abandoned', requireAdminAuth, async (req, res) => {
+  const now = new Date().toISOString();
 
-  await sendWATemplate(checkout.phone, 'cart_reminder', 'ar', [
-    checkout.name,
-    checkout.items,
-    checkout.total,
-    checkout.url
-  ]);
+  // Fetch all due rows that haven't been sent yet
+  const { data: dueRows, error: fetchError } = await supabase
+    .from('mm_abandoned_checkouts')
+    .select('*')
+    .eq('sent', false)
+    .lte('scheduled_at', now);
 
-  abandonedCheckouts[token].reminded = true;
-  saveJSON(ABANDONED_FILE, abandonedCheckouts);
-  delete abandonedTimers[token];
-  console.log(`📤 Abandoned checkout reminder sent to ${checkout.phone}`);
-}
+  if (fetchError) {
+    console.error('❌ Cron fetch error:', fetchError.message);
+    return res.status(500).json({ error: fetchError.message });
+  }
 
-// ── Cancel abandoned timer when order is placed ──────────────────
-function cancelAbandonedTimerByPhone(phone) {
-  for (const [token, checkout] of Object.entries(abandonedCheckouts)) {
-    if (checkout.phone === phone && !checkout.completed) {
-      if (abandonedTimers[token]) {
-        clearTimeout(abandonedTimers[token]);
-        delete abandonedTimers[token];
-      }
-      abandonedCheckouts[token].completed = true;
+  if (!dueRows || dueRows.length === 0) {
+    return res.json({ processed: 0, message: 'No due reminders' });
+  }
+
+  console.log(`⏰ Cron: ${dueRows.length} abandoned checkout reminder(s) to send`);
+  let sent = 0, failed = 0;
+
+  for (const row of dueRows) {
+    try {
+      await sendWATemplate(row.phone, 'cart_reminder', 'ar', [
+        row.cust_name,
+        row.items,
+        row.total,
+        row.checkout_url
+      ]);
+
+      // Mark as sent
+      await supabase
+        .from('mm_abandoned_checkouts')
+        .update({ sent: true, sent_at: new Date().toISOString() })
+        .eq('id', row.id);
+
+      console.log(`📤 Abandoned checkout reminder sent to ${row.phone}`);
+      sent++;
+    } catch(e) {
+      console.error(`❌ Failed to send reminder to ${row.phone}:`, e.message);
+      failed++;
+    }
+
+    // Small delay between sends to avoid rate limiting
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  res.json({ processed: dueRows.length, sent, failed });
+});
+
+// ── Cancel abandoned checkout reminder when order is placed ─────
+async function cancelAbandonedTimerByPhone(phone) {
+  try {
+    const { error } = await supabase
+      .from('mm_abandoned_checkouts')
+      .update({ sent: true, sent_at: new Date().toISOString() })
+      .eq('phone', phone)
+      .eq('sent', false);
+
+    if (error) {
+      console.error('cancelAbandonedTimerByPhone error:', error.message);
+    } else {
       console.log(`✅ Cancelled abandoned reminder for ${phone} — order placed`);
     }
+  } catch(e) {
+    console.error('cancelAbandonedTimerByPhone exception:', e.message);
   }
-  saveJSON(ABANDONED_FILE, abandonedCheckouts);
 }
 
 // ================================================================
-// 3. META WHATSAPP WEBHOOK — verify (GET)
+// 4. META WHATSAPP WEBHOOK — verify (GET)
 // ================================================================
 app.get('/webhook/whatsapp', (req, res) => {
   const mode      = req.query['hub.mode'];
@@ -267,7 +300,7 @@ app.get('/webhook/whatsapp', (req, res) => {
 });
 
 // ================================================================
-// 4. META WHATSAPP WEBHOOK — incoming messages (POST)
+// 5. META WHATSAPP WEBHOOK — incoming messages (POST)
 // ================================================================
 app.post('/webhook/whatsapp', async (req, res) => {
   res.sendStatus(200);
@@ -306,14 +339,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
     saveJSON(PENDING_FILE, pendingOrders);
 
     if (order.isCOD) {
-      // COD — no charge to refund; team will cancel in Odoo manually
       await sendWATemplate(from, ORDER_TEMPLATES.cancelled_cod, 'ar', [
         order.name, String(order.orderNo)
       ]);
       await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
 
     } else {
-      // Card — attempt Shopify refund; team will cancel in Odoo manually
       const refund = await shopifyRefund(order.shopifyId);
       const refundInfo = refund.success
         ? `سيتم استرداد ${refund.amount} EGP تلقائياً خلال 3-7 أيام عمل حسب بنكك 🙏`
@@ -331,7 +362,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 });
 
 // ================================================================
-// 5. RETRY LOGIC — no reply after 1 hour
+// 6. RETRY LOGIC — no reply after 1 hour
 // ================================================================
 async function retryIfNoReply(phone) {
   const order = pendingOrders[phone];
@@ -390,8 +421,8 @@ async function shopifyRefund(shopifyOrderId) {
       method: 'POST', headers,
       body: JSON.stringify({ refund: {
         currency: payment.currency,
-        notify:   false,
-        note:     'Customer cancelled via WhatsApp before fulfillment',
+        notify: false,
+        note: 'Customer cancelled via WhatsApp before fulfillment',
         refund_line_items: order.line_items.map(i => ({
           line_item_id: i.id, quantity: i.quantity, restock_type: 'return'
         })),
@@ -450,14 +481,14 @@ async function sendWATemplate(phone, templateName, languageCode, params) {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
-          'Content-Type':  'application/json'
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           messaging_product: 'whatsapp',
-          to:   phone,
+          to: phone,
           type: 'template',
           template: {
-            name:     templateName,
+            name: templateName,
             language: { code: languageCode },
             components
           }
@@ -488,8 +519,6 @@ function normalisePhone(phone) {
 }
 
 function isCodOrder(order) {
-  // Only trust the payment gateway — do NOT use financial_status (it is 'pending'
-  // for a few seconds on card orders too, which would misclassify them as COD).
   return ['cash_on_delivery', 'cod', 'manual'].includes(
     (order.payment_gateway || '').toLowerCase()
   );
@@ -500,23 +529,21 @@ function isCodOrder(order) {
 // ================================================================
 app.get('/', (req, res) => {
   res.json({
-    status:          'running',
-    time:            new Date().toISOString(),
-    pendingOrders:   Object.keys(pendingOrders).length,
-    abandonedTimers: Object.keys(abandonedTimers).length,
-    abandonedTotal:  Object.keys(abandonedCheckouts).length
+    status: 'running',
+    time: new Date().toISOString(),
+    pendingOrders: Object.keys(pendingOrders).length
   });
 });
 
 // ================================================================
-// ADMIN — list pending orders  (requires x-admin-secret header)
+// ADMIN — list pending orders (requires x-admin-secret header)
 // ================================================================
 app.get('/admin/pending', requireAdminAuth, (req, res) => {
   res.json(pendingOrders);
 });
 
 // ================================================================
-// ADMIN — BULK SEND  (requires x-admin-secret header)
+// ADMIN — BULK SEND (requires x-admin-secret header)
 // POST /admin/bulk-send
 // Body: { "orders": [ { "phone", "firstName", "name", "shopifyId", "total", "items", "isCOD" } ] }
 // ================================================================
@@ -540,14 +567,14 @@ app.post('/admin/bulk-send', requireAdminAuth, async (req, res) => {
       ]);
 
       pendingOrders[o.phone] = {
-        orderNo:   o.name,
+        orderNo: o.name,
         shopifyId: String(o.shopifyId || ''),
-        name:      o.firstName || 'عميلنا',
-        total:     o.total,
-        isCOD:     o.isCOD !== false,
-        gateway:   'cash_on_delivery',
-        sentAt:    Date.now(),
-        retried:   false,
+        name: o.firstName || 'عميلنا',
+        total: o.total,
+        isCOD: o.isCOD !== false,
+        gateway: 'cash_on_delivery',
+        sentAt: Date.now(),
+        retried: false,
         confirmed: false,
         cancelled: false
       };
@@ -587,16 +614,14 @@ app.get('/admin/test-abandoned', requireAdminAuth, async (req, res) => {
 });
 
 // ================================================================
-// SUBMIT ORDER TEMPLATES TO META  (requires x-admin-secret)
+// SUBMIT ORDER TEMPLATES TO META (requires x-admin-secret)
 // GET /submit-order-templates?secret=...
-// Submits all 6 order templates for Meta review.
-// Run once — re-running is safe (Meta will reject duplicates gracefully).
 // ================================================================
 app.get('/submit-order-templates', requireAdminAuth, async (req, res) => {
-  const url = `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates`;
+  const url     = `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates`;
   const headers = {
     'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
-    'Content-Type':  'application/json'
+    'Content-Type': 'application/json'
   };
 
   const templates = [
@@ -639,7 +664,7 @@ app.get('/submit-order-templates', requireAdminAuth, async (req, res) => {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          name:     tpl.name,
+          name: tpl.name,
           language: 'ar',
           category: 'UTILITY',
           components: [{
@@ -661,7 +686,7 @@ app.get('/submit-order-templates', requireAdminAuth, async (req, res) => {
 });
 
 // ================================================================
-// META WEBHOOK — delivery status callbacks (GET = verify, POST = events)
+// META WEBHOOK — delivery status callbacks
 // ================================================================
 app.get('/webhook/meta', (req, res) => {
   const mode      = req.query['hub.mode'];
@@ -675,10 +700,10 @@ app.get('/webhook/meta', (req, res) => {
 });
 
 app.post('/webhook/meta', (req, res) => {
-  res.status(200).send('ok'); // always ack immediately
+  res.status(200).send('ok');
   const body = req.body;
   try {
-    const changes = body?.entry?.[0]?.changes?.[0]?.value;
+    const changes  = body?.entry?.[0]?.changes?.[0]?.value;
     const statuses = changes?.statuses;
     if (statuses) {
       for (const s of statuses) {
@@ -697,13 +722,12 @@ app.post('/webhook/meta', (req, res) => {
 });
 
 // ================================================================
-// ADMIN — CHECK ALL TEMPLATES  (requires x-admin-secret)
+// ADMIN — CHECK ALL TEMPLATES (requires x-admin-secret)
 // GET /admin/all-templates?secret=...
-// Shows name, category, status for every template on the WABA.
 // ================================================================
 app.get('/admin/all-templates', requireAdminAuth, async (req, res) => {
   try {
-    const r = await fetch(
+    const r    = await fetch(
       `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates?fields=name,status,category,language&limit=50`,
       { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
     );
@@ -715,14 +739,13 @@ app.get('/admin/all-templates', requireAdminAuth, async (req, res) => {
 });
 
 // ================================================================
-// SUBMIT CART REMINDER TEMPLATE AS UTILITY  (requires x-admin-secret)
+// SUBMIT CART REMINDER TEMPLATE AS UTILITY (requires x-admin-secret)
 // GET /submit-abandoned-template?secret=...
-// Submits "cart_reminder" as UTILITY (replaces old MARKETING template).
 // ================================================================
 app.get('/submit-abandoned-template', requireAdminAuth, async (req, res) => {
   const headers = {
     'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
-    'Content-Type':  'application/json'
+    'Content-Type': 'application/json'
   };
 
   const templateName = 'cart_reminder';
@@ -734,7 +757,7 @@ app.get('/submit-abandoned-template', requireAdminAuth, async (req, res) => {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          name:     templateName,
+          name: templateName,
           language: 'ar',
           category: 'UTILITY',
           components: [{
@@ -761,5 +784,5 @@ app.use('/returns', returnsRouter);
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   restoreOrderTimers();
-  restoreAbandonedTimers();
+  // Abandoned checkout timers are now Supabase-backed — no in-memory restore needed
 });
