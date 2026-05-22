@@ -72,19 +72,35 @@ const ORDER_TEMPLATES = {
   cancelled_card: 'order_cancelled_card', // params: name, order#, refundInfo
 };
 
-// ── Persistent storage for pending orders (file-based, small + safe) ──
-const PENDING_FILE = './pendingOrders.json';
-let pendingOrders = loadJSON(PENDING_FILE);
+// ── Pending orders — in-memory map + Supabase persistence ────────
+// Supabase table: mm_pending_orders (phone text PK, data jsonb, created_at timestamptz)
+let pendingOrders = {};   // phone → order object (fast in-memory lookup)
 
-function loadJSON(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
+async function savePendingOrder(phone, order) {
+  pendingOrders[phone] = order;
+  try {
+    await supabase.from('mm_pending_orders').upsert({ phone, data: order }, { onConflict: 'phone' });
+  } catch(e) { console.error('savePendingOrder error:', e.message); }
 }
-function saveJSON(file, data) {
-  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); } catch(e) { console.error('saveJSON error:', e.message); }
+
+async function deletePendingOrder(phone) {
+  delete pendingOrders[phone];
+  try { await supabase.from('mm_pending_orders').delete().eq('phone', phone); }
+  catch(e) { console.error('deletePendingOrder error:', e.message); }
+}
+
+async function loadAllPendingOrders() {
+  try {
+    const { data, error } = await supabase.from('mm_pending_orders').select('phone, data');
+    if (error) { console.error('loadAllPendingOrders error:', error.message); return; }
+    (data || []).forEach(row => { pendingOrders[row.phone] = row.data; });
+    console.log(`♻️ Loaded ${(data||[]).length} pending order(s) from Supabase`);
+  } catch(e) { console.error('loadAllPendingOrders exception:', e.message); }
 }
 
 // ── Restore order confirmation timers on restart ─────────────────
-function restoreOrderTimers() {
+async function restoreOrderTimers() {
+  await loadAllPendingOrders();
   const now = Date.now();
   let restored = 0;
   for (const [phone, order] of Object.entries(pendingOrders)) {
@@ -143,7 +159,7 @@ app.post('/webhook/order-created', async (req, res) => {
 
   await cancelAbandonedTimerByPhone(phone);
 
-  pendingOrders[phone] = {
+  await savePendingOrder(phone, {
     orderNo: o.order_number,
     shopifyId: String(o.id),
     name,
@@ -154,8 +170,7 @@ app.post('/webhook/order-created', async (req, res) => {
     retried: false,
     confirmed: false,
     cancelled: false
-  };
-  saveJSON(PENDING_FILE, pendingOrders);
+  });
 
   await sendWATemplate(phone, ORDER_TEMPLATES.confirmation, 'ar', [
     name, String(o.order_number), payNote, String(o.total_price), items
@@ -317,18 +332,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
   if (!order) return;
 
   if (reply === '1') {
-    order.confirmed = true;
-    saveJSON(PENDING_FILE, pendingOrders);
     await sendWATemplate(from, ORDER_TEMPLATES.confirmed, 'ar', [order.name, String(order.orderNo)]);
     const shopifyTag = order.isCOD ? 'COD-Confirmed' : 'Card-Confirmed';
     await tagShopifyOrder(order.shopifyId, shopifyTag);
-    delete pendingOrders[from];
-    saveJSON(PENDING_FILE, pendingOrders);
+    await deletePendingOrder(from);
 
   } else if (reply === '2') {
-    order.cancelled = true;
-    saveJSON(PENDING_FILE, pendingOrders);
-
     if (order.isCOD) {
       await sendWATemplate(from, ORDER_TEMPLATES.cancelled_cod, 'ar', [order.name, String(order.orderNo)]);
       await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
@@ -340,9 +349,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
       await sendWATemplate(from, ORDER_TEMPLATES.cancelled_card, 'ar', [order.name, String(order.orderNo), refundInfo]);
       await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
     }
-
-    delete pendingOrders[from];
-    saveJSON(PENDING_FILE, pendingOrders);
+    await deletePendingOrder(from);
   }
 });
 
@@ -353,7 +360,7 @@ async function retryIfNoReply(phone) {
   const order = pendingOrders[phone];
   if (!order || order.confirmed || order.cancelled || order.retried) return;
   order.retried = true;
-  saveJSON(PENDING_FILE, pendingOrders);
+  await savePendingOrder(phone, order);
   await sendWATemplate(phone, ORDER_TEMPLATES.reminder, 'ar', [order.name, String(order.orderNo)]);
   setTimeout(() => autoConfirmIfNoReply(phone), 3 * 60 * 60 * 1000);
 }
@@ -362,13 +369,11 @@ async function autoConfirmIfNoReply(phone) {
   const order = pendingOrders[phone];
   if (!order || order.confirmed || order.cancelled) return;
   order.confirmed = true;
-  saveJSON(PENDING_FILE, pendingOrders);
   console.log(`⏰ Auto-confirming order #${order.orderNo} for ${phone} — no reply in 4 hours`);
   await sendWATemplate(phone, ORDER_TEMPLATES.auto_confirmed, 'ar', [order.name, String(order.orderNo)]);
   const shopifyTag = order.isCOD ? 'COD-Confirmed' : 'Card-Confirmed';
   await tagShopifyOrder(order.shopifyId, shopifyTag);
-  delete pendingOrders[phone];
-  saveJSON(PENDING_FILE, pendingOrders);
+  await deletePendingOrder(phone);
 }
 
 // ================================================================
@@ -499,7 +504,7 @@ function isCodOrder(order) {
 // HEALTH CHECK
 // ================================================================
 app.get('/', (req, res) => {
-  res.json({ status: 'running', time: new Date().toISOString(), pendingOrders: Object.keys(pendingOrders).length });
+  res.json({ status: 'running', time: new Date().toISOString(), pendingOrdersInMemory: Object.keys(pendingOrders).length });
 });
 
 // ================================================================
@@ -526,12 +531,11 @@ app.post('/admin/bulk-send', requireAdminAuth, async (req, res) => {
       await sendWATemplate(o.phone, ORDER_TEMPLATES.confirmation, 'ar', [
         o.firstName || 'عميلنا', String(o.name), 'الدفع عند الاستلام', String(o.total), String(o.items)
       ]);
-      pendingOrders[o.phone] = {
+      await savePendingOrder(o.phone, {
         orderNo: o.name, shopifyId: String(o.shopifyId || ''), name: o.firstName || 'عميلنا',
         total: o.total, isCOD: o.isCOD !== false, gateway: 'cash_on_delivery',
         sentAt: Date.now(), retried: false, confirmed: false, cancelled: false
-      };
-      saveJSON(PENDING_FILE, pendingOrders);
+      });
       setTimeout(() => retryIfNoReply(o.phone), 60 * 60 * 1000);
       console.log(`✅ Bulk sent + registered: ${o.name} → ${o.phone}`);
       sent++;
@@ -542,7 +546,6 @@ app.post('/admin/bulk-send', requireAdminAuth, async (req, res) => {
     await new Promise(r => setTimeout(r, 350));
   }
 
-  saveJSON(PENDING_FILE, pendingOrders);
   console.log(`📤 Bulk send done: ${sent} sent, ${failed} failed`);
   res.json({ sent, failed, errors });
 });
@@ -646,6 +649,36 @@ app.post('/webhook/meta', async (req, res) => {
           else       console.log(`💾 Saved inbound msg from ${fromNorm} to mm_wa_inbox`);
         } catch(dbEx) {
           console.error('❌ mm_wa_inbox insert exception:', dbEx.message);
+        }
+
+        // ── Order confirmation reply (1 = confirm, 2 = cancel) ──
+        const reply = (text || '').trim();
+        if (reply === '1' || reply === '2') {
+          const order = pendingOrders[fromNorm];
+          if (order && !order.confirmed && !order.cancelled) {
+            console.log(`🔔 Order reply "${reply}" from ${fromNorm} — order #${order.orderNo}`);
+            if (reply === '1') {
+              await sendWATemplate(fromNorm, ORDER_TEMPLATES.confirmed, 'ar', [order.name, String(order.orderNo)]);
+              const shopifyTag = order.isCOD ? 'COD-Confirmed' : 'Card-Confirmed';
+              await tagShopifyOrder(order.shopifyId, shopifyTag);
+              await deletePendingOrder(fromNorm);
+              console.log(`✅ Tagged order #${order.orderNo} as ${shopifyTag}`);
+            } else {
+              if (order.isCOD) {
+                await sendWATemplate(fromNorm, ORDER_TEMPLATES.cancelled_cod, 'ar', [order.name, String(order.orderNo)]);
+                await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
+              } else {
+                const refund = await shopifyRefund(order.shopifyId);
+                const refundInfo = refund.success
+                  ? `سيتم استرداد ${refund.amount} EGP تلقائياً خلال 3-7 أيام عمل حسب بنكك 🙏`
+                  : 'سيتم معالجة الاسترداد يدوياً خلال 24 ساعة 🙏';
+                await sendWATemplate(fromNorm, ORDER_TEMPLATES.cancelled_card, 'ar', [order.name, String(order.orderNo), refundInfo]);
+                await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
+              }
+              await deletePendingOrder(fromNorm);
+              console.log(`❌ Tagged order #${order.orderNo} as COD-Cancelled`);
+            }
+          }
         }
       }
     }
