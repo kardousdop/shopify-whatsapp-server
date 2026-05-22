@@ -1,12 +1,12 @@
 // ================================================================
 // shopify-whatsapp-server — server.js
 // Features:
-// ✅ Order confirmation (COD + Card)
+// ✅ Order confirmation (COD + Card) — WhatsApp templates
 // ✅ Customer cancel reply via WhatsApp
 // ✅ Auto-confirm overdue orders
 // ✅ Abandoned checkout WhatsApp reminder
-// ✅ Meta WhatsApp Cloud API
-// ✅ Shopify order tagging (COD-Confirmed / COD-Cancelled)
+// ✅ Meta WhatsApp Cloud API (templates only — no free-form)
+// ✅ Shopify order tagging (COD-Confirmed / Card-Confirmed / COD-Cancelled)
 // ✅ Bulk send endpoint for manual campaigns
 // ℹ️  Odoo integration removed — cancellations handled manually in Odoo
 // ================================================================
@@ -41,13 +41,26 @@ const {
   PORT = 3000
 } = process.env;
 
+// WhatsApp Business Account ID (for template submission)
+const WABA_ID = process.env.WABA_ID || '900960922811775';
+
+// ── Order template names (must match approved Meta templates) ────
+const ORDER_TEMPLATES = {
+  confirmation:   'order_confirmation',    // params: name, order#, payNote, total, items
+  reminder:       'order_reminder',        // params: name, order#
+  auto_confirmed: 'order_autoconfirmed',   // params: name, order#
+  confirmed:      'order_confirmed',       // params: name, order#
+  cancelled_cod:  'order_cancelled_cod',   // params: name, order#
+  cancelled_card: 'order_cancelled_card',  // params: name, order#, refundInfo
+};
+
 // ── Persistent storage for pending orders ───────────────────────
 const PENDING_FILE   = './pendingOrders.json';
 const ABANDONED_FILE = './abandonedCheckouts.json';
 
-let pendingOrders    = loadJSON(PENDING_FILE);
+let pendingOrders      = loadJSON(PENDING_FILE);
 let abandonedCheckouts = loadJSON(ABANDONED_FILE);
-let abandonedTimers  = {};
+let abandonedTimers    = {};
 
 function loadJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
@@ -127,35 +140,27 @@ app.post('/webhook/order-created', async (req, res) => {
   const isCOD  = isCodOrder(o);
   const name   = o.customer?.first_name || 'عميلنا';
   const items  = (o.line_items || []).map(i => `${i.name} ×${i.quantity}`).join('، ');
+  const payNote = isCOD ? 'الدفع عند الاستلام' : 'تم الدفع بالبطاقة';
 
   cancelAbandonedTimerByPhone(phone);
 
   pendingOrders[phone] = {
-    orderNo:  o.order_number,
+    orderNo:   o.order_number,
     shopifyId: String(o.id),
     name,
-    total:    o.total_price,
+    total:     o.total_price,
     isCOD,
-    gateway:  o.payment_gateway,
-    sentAt:   Date.now(),
-    retried:  false,
+    gateway:   o.payment_gateway,
+    sentAt:    Date.now(),
+    retried:   false,
     confirmed: false,
     cancelled: false
   };
   saveJSON(PENDING_FILE, pendingOrders);
 
-  const payNote = isCOD ? '💵 الدفع عند الاستلام' : '💳 تم الدفع بالبطاقة';
-
-  await sendWA(phone,
-    `مرحباً ${name}! 👋\n\n` +
-    `شكراً لطلبك من myMayz 🎉\n\n` +
-    `📦 رقم الطلب: #${o.order_number}\n` +
-    `${payNote} — ${o.total_price} EGP\n` +
-    `🛍️ ${items}\n\n` +
-    `يرجى تأكيد طلبك الآن:\n` +
-    `✅ اكتب *1* للتأكيد\n` +
-    `❌ اكتب *2* للإلغاء`
-  );
+  await sendWATemplate(phone, ORDER_TEMPLATES.confirmation, 'ar', [
+    name, String(o.order_number), payNote, String(o.total_price), items
+  ]);
 
   setTimeout(() => retryIfNoReply(phone), 60 * 60 * 1000);
 });
@@ -286,13 +291,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
     order.confirmed = true;
     saveJSON(PENDING_FILE, pendingOrders);
 
-    await sendWA(from,
-      `✅ تم تأكيد طلبك #${order.orderNo} بنجاح!\n` +
-      `سيتم التجهيز والشحن قريباً 🎉\n\n` +
-      `شكراً لثقتك في myMayz 🙏`
-    );
+    await sendWATemplate(from, ORDER_TEMPLATES.confirmed, 'ar', [
+      order.name, String(order.orderNo)
+    ]);
 
-    await tagShopifyOrder(order.shopifyId, 'COD-Confirmed');
+    const shopifyTag = order.isCOD ? 'COD-Confirmed' : 'Card-Confirmed';
+    await tagShopifyOrder(order.shopifyId, shopifyTag);
     delete pendingOrders[from];
     saveJSON(PENDING_FILE, pendingOrders);
 
@@ -303,29 +307,21 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     if (order.isCOD) {
       // COD — no charge to refund; team will cancel in Odoo manually
-      await sendWA(from,
-        `تم استلام طلب الإلغاء لطلبك #${order.orderNo} ✅\n\n` +
-        `لا توجد مبالغ محصلة (الدفع عند الاستلام).\n` +
-        `سيتم إلغاء الطلب خلال 24 ساعة 🙏\n\n` +
-        `يمكنك الطلب مرة أخرى في أي وقت ❤️`
-      );
+      await sendWATemplate(from, ORDER_TEMPLATES.cancelled_cod, 'ar', [
+        order.name, String(order.orderNo)
+      ]);
       await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
 
     } else {
       // Card — attempt Shopify refund; team will cancel in Odoo manually
       const refund = await shopifyRefund(order.shopifyId);
-      if (refund.success) {
-        await sendWA(from,
-          `تم إلغاء طلبك #${order.orderNo} ✅\n\n` +
-          `💳 سيتم استرداد ${refund.amount} EGP تلقائياً\n` +
-          `⏱️ خلال 3–7 أيام عمل حسب بنكك 🙏`
-        );
-      } else {
-        await sendWA(from,
-          `تم إلغاء طلبك #${order.orderNo} ✅\n` +
-          `⚠️ سيتم معالجة الاسترداد يدوياً خلال 24 ساعة 🙏`
-        );
-      }
+      const refundInfo = refund.success
+        ? `سيتم استرداد ${refund.amount} EGP تلقائياً خلال 3-7 أيام عمل حسب بنكك 🙏`
+        : 'سيتم معالجة الاسترداد يدوياً خلال 24 ساعة 🙏';
+
+      await sendWATemplate(from, ORDER_TEMPLATES.cancelled_card, 'ar', [
+        order.name, String(order.orderNo), refundInfo
+      ]);
       await tagShopifyOrder(order.shopifyId, 'COD-Cancelled');
     }
 
@@ -344,12 +340,9 @@ async function retryIfNoReply(phone) {
   order.retried = true;
   saveJSON(PENDING_FILE, pendingOrders);
 
-  await sendWA(phone,
-    `مرحباً! لاحظنا أنك لم تؤكد طلبك #${order.orderNo} بعد ⏰\n\n` +
-    `✅ رد *1* للتأكيد\n` +
-    `❌ رد *2* للإلغاء\n\n` +
-    `إذا لم نتلقَ ردًا، سيتم تأكيل الطلب تلقائياً خلال 3 ساعات.`
-  );
+  await sendWATemplate(phone, ORDER_TEMPLATES.reminder, 'ar', [
+    order.name, String(order.orderNo)
+  ]);
 
   setTimeout(() => autoConfirmIfNoReply(phone), 3 * 60 * 60 * 1000);
 }
@@ -363,13 +356,10 @@ async function autoConfirmIfNoReply(phone) {
 
   console.log(`⏰ Auto-confirming order #${order.orderNo} for ${phone} — no reply in 4 hours`);
 
-  await sendWA(phone,
-    `تم تأكيد طلبك #${order.orderNo} تلقائياً ✅\n\n` +
-    `سيتم التجهيز والشحن قريباً 🚚\n\n` +
-    `شكراً لثقتك في myMayz 🙏`
-  );
+  await sendWATemplate(phone, ORDER_TEMPLATES.auto_confirmed, 'ar', [
+    order.name, String(order.orderNo)
+  ]);
 
-  // Tag correctly based on payment type
   const shopifyTag = order.isCOD ? 'COD-Confirmed' : 'Card-Confirmed';
   await tagShopifyOrder(order.shopifyId, shopifyTag);
 
@@ -445,40 +435,6 @@ async function tagShopifyOrder(shopifyOrderId, tag) {
 }
 
 // ================================================================
-// META WHATSAPP CLOUD API — send free-form text
-// NOTE: Only works within a 24-hour customer service window (customer messaged first).
-//       For business-initiated messages, use sendWATemplate() with an approved template.
-// ================================================================
-async function sendWA(phone, message) {
-  try {
-    const r = await fetch(
-      `https://graph.facebook.com/v19.0/${META_PHONE_NUMBER_ID}/messages`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
-          'Content-Type':  'application/json'
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          to:   phone,
-          type: 'text',
-          text: { body: message }
-        })
-      }
-    );
-    const data = await r.json();
-    if (data.error) {
-      console.error(`❌ WA send error to ${phone}:`, data.error.message);
-    } else {
-      console.log(`✅ WA sent to ${phone}: ${message.substring(0, 60)}...`);
-    }
-  } catch(e) {
-    console.error('sendWA error:', e.message);
-  }
-}
-
-// ================================================================
 // META WHATSAPP — send template message
 // ================================================================
 async function sendWATemplate(phone, templateName, languageCode, params) {
@@ -510,7 +466,7 @@ async function sendWATemplate(phone, templateName, languageCode, params) {
     );
     const data = await r.json();
     if (data.error) {
-      console.error(`❌ WA template error to ${phone}:`, JSON.stringify(data.error));
+      console.error(`❌ WA template error to ${phone} [${templateName}]:`, JSON.stringify(data.error));
     } else {
       console.log(`✅ WA template "${templateName}" sent to ${phone}`);
     }
@@ -574,18 +530,14 @@ app.post('/admin/bulk-send', requireAdminAuth, async (req, res) => {
   for (const o of orders) {
     if (!o.phone) { failed++; errors.push(`${o.name}: no phone`); continue; }
 
-    const msg =
-      `مرحباً ${o.firstName || 'عميلنا'}! 👋\n\n` +
-      `شكراً لطلبك من myMayz 🎉\n\n` +
-      `📦 رقم الطلب: ${o.name}\n` +
-      `💵 المبلغ عند الاستلام: ${o.total} EGP\n` +
-      `🛍️ ${o.items}\n\n` +
-      `يرجى تأكيد طلبك الآن:\n` +
-      `✅ اكتب *1* للتأكيد\n` +
-      `❌ اكتب *2* للإلغاء`;
-
     try {
-      await sendWA(o.phone, msg);
+      await sendWATemplate(o.phone, ORDER_TEMPLATES.confirmation, 'ar', [
+        o.firstName || 'عميلنا',
+        String(o.name),
+        'الدفع عند الاستلام',
+        String(o.total),
+        String(o.items)
+      ]);
 
       pendingOrders[o.phone] = {
         orderNo:   o.name,
@@ -632,6 +584,79 @@ app.get('/admin/test-abandoned', requireAdminAuth, async (req, res) => {
   ]);
   console.log(`🧪 Test abandoned template sent to ${phone}`);
   res.json({ sent: true, to: phone });
+});
+
+// ================================================================
+// SUBMIT ORDER TEMPLATES TO META  (requires x-admin-secret)
+// GET /submit-order-templates?secret=...
+// Submits all 6 order templates for Meta review.
+// Run once — re-running is safe (Meta will reject duplicates gracefull==============================================================
+app.get('/submit-order-templates', requireAdminAuth, async (req, res) => {
+  const url = `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates`;
+  const headers = {
+    'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
+    'Content-Type':  'application/json'
+  };
+
+  const templates = [
+    {
+      name: 'order_confirmation',
+      body: 'مرحباً {{1}}! 👋\n\nشكراً لطلبك من myMayz 🎉\n\n📦 رقم الطلب: #{{2}}\n{{3}} — {{4}} EGP\n🛍️ {{5}}\n\nيرجى تأكيد طلبك الآن:\n✅ اكتب *1* للتأكيد\n❌ اكتب *2* للإلغاء\n\n— فريق myMayz 🌿',
+      example: [['أحمد', '53760', 'الدفع عند الاستلام', '299', 'Alkaline Clay Water Bottle ×1']]
+    },
+    {
+      name: 'order_reminder',
+      body: 'مرحباً {{1}}! ⏰\n\nلاحظنا أنك لم تؤكد طلبك #{{2}} بعد\n\n✅ رد *1* للتأكيد\n❌ رد *2* للإلغاء\n\nإذا لم نتلقَ ردًا، سيتم تأكيد الطلب تلقائياً خلال 3 ساعات.\n\n— فريق myMayz 🌿',
+      example: [['أحمد', '53760']]
+    },
+    {
+      name: 'order_autoconfirmed',
+      body: 'مرحباً {{1}}! ✅\n\nتم تأكيد طلبك #{{2}} تلقائياً\n\nسيتم التجهيز والشحن قريباً 🚚\n\nشكراً لثقتك في myMayz 🙏\n\n— فريق myMayz 🌿',
+      example: [['أحمد', '53760']]
+    },
+    {
+      name: 'order_confirmed',
+      body: 'مرحباً {{1}}! 🎉\n\nتم تأكيد طلبك #{{2}} بنجاح ✅\n\nسيتم التجهيز والشحن قريباً\n\nشكراً لثقتك في myMayz 🙏\n\n— فريق myMayz 🌿',
+      example: [['أحمد', '53760']]
+    },
+    {
+      name: 'order_cancelled_cod',
+      body: 'مرحباً {{1}}!\n\nتم استلام طلب الإلغاء لطلبك #{{2}} ✅\n\nلا توجد مبالغ محصلة (الدفع عند الاستلام).\nسيتم إلغاء الطلب خلال 24 ساعة 🙏\n\nيمكنك الطلب مرة أخرى في أي وقت ❤️\n\n— فريق myMayz 🌿',
+      example: [['أحمد', '53760']]
+    },
+    {
+      name: 'order_cancelled_card',
+      body: 'مرحباً {{1}}!\n\nتم إلغاء طلبك #{{2}} ✅\n\n{{3}}\n\n— فريق myMayz 🌿',
+      example: [['أحمد', '53760', 'سيتم استرداد 299 EGP تلقائياً خلال 3-7 أيام عمل حسب بنكك 🙏']]
+    }
+  ];
+
+  const results = [];
+  for (const tpl of templates) {
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          name:     tpl.name,
+          language: 'ar',
+          category: 'UTILITY',
+          components: [{
+            type: 'BODY',
+            text: tpl.body,
+            example: { body_text: tpl.example }
+          }]
+        })
+      });
+      const data = await r.json();
+      results.push({ name: tpl.name, ok: r.ok, data });
+      console.log(`📋 Template "${tpl.name}": ${r.ok ? '✅ submitted' : '❌ ' + JSON.stringify(data.error)}`);
+    } catch(e) {
+      results.push({ name: tpl.name, ok: false, error: e.message });
+    }
+  }
+
+  res.json({ submitted: results.length, results });
 });
 
 // ================================================================
