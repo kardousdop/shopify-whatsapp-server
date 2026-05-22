@@ -187,14 +187,32 @@ app.post('/webhook/checkout', async (req, res) => {
   res.status(200).send('ok');
 
   const checkout = req.body;
-  const phone    = normalisePhone(
+  let phone = normalisePhone(
     checkout.billing_address?.phone ||
     checkout.shipping_address?.phone ||
     checkout.phone
   );
 
+  // ── Fallback: look up phone from Shopify customer account via email ──
+  if (!phone && checkout.email) {
+    try {
+      const custRes = await fetch(
+        `https://${SHOPIFY_STORE_URL}/admin/api/2024-01/customers/search.json?query=email:${encodeURIComponent(checkout.email)}&fields=id,phone&limit=1`,
+        { headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN } }
+      );
+      const custData = await custRes.json();
+      const custPhone = custData.customers?.[0]?.phone;
+      if (custPhone) {
+        phone = normalisePhone(custPhone);
+        console.log(`📞 Resolved phone ${phone} from customer email ${checkout.email}`);
+      }
+    } catch(e) {
+      console.error('Customer phone lookup error:', e.message);
+    }
+  }
+
   if (!phone) {
-    console.log(`⚠️ Abandoned checkout ${checkout.token} — no phone number, skipping`);
+    console.log(`⚠️ Abandoned checkout ${checkout.token} — no phone number (email: ${checkout.email || 'none'}), skipping`);
     return;
   }
 
