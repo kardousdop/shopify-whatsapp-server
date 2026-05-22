@@ -32,7 +32,6 @@ app.use((req, res, next) => {
 const {
   META_ACCESS_TOKEN,
   META_PHONE_NUMBER_ID,
-  META_VERIFY_TOKEN,
   META_APP_SECRET,
   SHOPIFY_STORE_URL,
   SHOPIFY_ADMIN_TOKEN,
@@ -40,6 +39,7 @@ const {
   ADMIN_SECRET = 'mymayz-admin-2024',
   PORT = 3000
 } = process.env;
+const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'mymayz-verify-2024';
 
 // WhatsApp Business Account ID (for template submission)
 const WABA_ID = process.env.WABA_ID || '900960922811775';
