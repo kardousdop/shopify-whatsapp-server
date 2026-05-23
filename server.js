@@ -531,7 +531,15 @@ function normalisePhone(phone) {
 }
 
 function isCodOrder(order) {
-  return ['cash_on_delivery', 'cod', 'manual'].includes((order.payment_gateway || '').toLowerCase());
+  const gateway = (order.payment_gateway || '').toLowerCase();
+  // Gateway-based detection — covers all common COD names
+  const isCodGateway = gateway.includes('cod') ||
+                       gateway.includes('cash') ||
+                       gateway.includes('delivery') ||
+                       gateway === 'manual';
+  // Financial status fallback — paid orders are always 'paid', COD starts as 'pending'
+  const isPending = order.financial_status === 'pending';
+  return isCodGateway || isPending;
 }
 
 // ================================================================
