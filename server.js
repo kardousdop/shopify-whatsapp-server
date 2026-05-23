@@ -1,12 +1,12 @@
 // ================================================================
 // shopify-whatsapp-server — server.js
 // Features:
-// ✅ Order confirmation (COD + Card) — WhatsApp templates
-// ✅ Customer cancel reply via WhatsApp
-// ✅ Auto-confirm overdue orders
+// ✅ COD orders  — confirmation flow (1/2 reply) → COD-Confirmed / COD-Cancelled
+// ✅ Paid orders — simple receipt message → tagged 'Paid' immediately, no reply needed
+// ✅ Auto-confirm overdue COD orders after 4 hours
 // ✅ Abandoned checkout WhatsApp reminder — Supabase-backed queue
 // ✅ Meta WhatsApp Cloud API (templates only — no free-form)
-// ✅ Shopify order tagging (COD-Confirmed / Card-Confirmed / COD-Cancelled)
+// ✅ Shopify order tagging (COD-Confirmed / COD-Cancelled / Paid)
 // ✅ Bulk send endpoint for manual campaigns
 // ✅ Inbound WA messages stored in mm_wa_inbox (Supabase)
 // ✅ Admin inbox endpoint GET /wa/inbox
@@ -64,7 +64,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ── Order template names (must match approved Meta templates) ────
 const ORDER_TEMPLATES = {
-  confirmation:   'order_confirmation',   // params: name, order#, payNote, total, items
+  confirmation:   'order_confirmation',   // COD only — params: name, order#, payNote, total, items
+  paid_received:  'order_received_paid',  // Paid only — params: name, order#
   reminder:       'order_reminder',       // params: name, order#
   auto_confirmed: 'order_autoconfirmed',  // params: name, order#
   confirmed:      'order_confirmed',      // params: name, order#
@@ -142,7 +143,9 @@ function requireAdminAuth(req, res, next) {
 }
 
 // ================================================================
-// 1. SHOPIFY — ORDER CREATED (confirmation flow)
+// 1. SHOPIFY — ORDER CREATED
+//    COD  → send confirmation request (reply 1/2), save to pendingOrders
+//    Paid → send simple receipt message, tag 'Paid' immediately
 // ================================================================
 app.post('/webhook/order-created', async (req, res) => {
   if (!verifyShopifyWebhook(req)) return res.status(401).send('Unauthorized');
@@ -152,31 +155,44 @@ app.post('/webhook/order-created', async (req, res) => {
   const phone = normalisePhone(o.billing_address?.phone || o.shipping_address?.phone || o.customer?.phone);
   if (!phone) { console.log(`⚠️ No phone on order #${o.order_number}`); return; }
 
-  const isCOD   = isCodOrder(o);
-  const name    = o.customer?.first_name || 'عميلنا';
-  const items   = (o.line_items || []).map(i => `${i.name} ×${i.quantity}`).join('، ');
-  const payNote = isCOD ? 'الدفع عند الاستلام' : 'تم الدفع بالبطاقة';
+  const isCOD = isCodOrder(o);
+  const name  = o.customer?.first_name || 'عميلنا';
 
   await cancelAbandonedTimerByPhone(phone);
 
-  await savePendingOrder(phone, {
-    orderNo: o.order_number,
-    shopifyId: String(o.id),
-    name,
-    total: o.total_price,
-    isCOD,
-    gateway: o.payment_gateway,
-    sentAt: Date.now(),
-    retried: false,
-    confirmed: false,
-    cancelled: false
-  });
+  if (isCOD) {
+    // ── COD: ask customer to confirm (1) or cancel (2) ──────────
+    const items   = (o.line_items || []).map(i => `${i.name} ×${i.quantity}`).join('، ');
+    const payNote = 'الدفع عند الاستلام';
 
-  await sendWATemplate(phone, ORDER_TEMPLATES.confirmation, 'ar', [
-    name, String(o.order_number), payNote, String(o.total_price), items
-  ]);
+    await savePendingOrder(phone, {
+      orderNo:  o.order_number,
+      shopifyId: String(o.id),
+      name,
+      total:    o.total_price,
+      isCOD:    true,
+      gateway:  o.payment_gateway,
+      sentAt:   Date.now(),
+      retried:  false,
+      confirmed: false,
+      cancelled: false
+    });
 
-  setTimeout(() => retryIfNoReply(phone), 60 * 60 * 1000);
+    await sendWATemplate(phone, ORDER_TEMPLATES.confirmation, 'ar', [
+      name, String(o.order_number), payNote, String(o.total_price), items
+    ]);
+
+    setTimeout(() => retryIfNoReply(phone), 60 * 60 * 1000);
+    console.log(`📦 COD order #${o.order_number} — confirmation sent to ${phone}`);
+
+  } else {
+    // ── Paid: send simple receipt, tag immediately, no pending state ──
+    await sendWATemplate(phone, ORDER_TEMPLATES.paid_received, 'ar', [
+      name, String(o.order_number)
+    ]);
+    await tagShopifyOrder(String(o.id), 'Paid');
+    console.log(`💳 Paid order #${o.order_number} — receipt sent to ${phone}, tagged 'Paid'`);
+  }
 });
 
 // ================================================================
@@ -588,6 +604,7 @@ app.get('/submit-order-templates', requireAdminAuth, async (req, res) => {
 
   const templates = [
     { name:'order_confirmation', body:'مرحباً {{1}}! 👋\n\nشكراً لطلبك من myMayz 🎉\n\n📦 رقم الطلب: #{{2}}\n{{3}} — {{4}} EGP\n🛍️ {{5}}\n\nيرجى تأكيد طلبك الآن:\n✅ اكتب *1* للتأكيد\n❌ اكتب *2* للإلغاء\n\n— فريق myMayz 🌿', example:[['أحمد','53760','الدفع عند الاستلام','299','Alkaline Clay Water Bottle ×1']] },
+    { name:'order_received_paid', body:'مرحباً {{1}}! 👋\n\nوصلنا طلبك رقم #{{2}} بنجاح ✅\nسيتم تجهيزه وإرساله في أقرب وقت 📦\n\nشكراً لثقتك في myMayz 🙏\n\n— فريق myMayz 🌿', example:[['أحمد','53760']] },
     { name:'order_reminder',     body:'مرحباً {{1}}! ⏰\n\nلاحظنا أنك لم تؤكد طلبك #{{2}} بعد\n\n✅ رد *1* للتأكيد\n❌ رد *2* للإلغاء\n\nإذا لم نتلقَ ردًا، سيتم تأكيد الطلب تلقائياً خلال 3 ساعات.\n\n— فريق myMayz 🌿', example:[['أحمد','53760']] },
     { name:'order_autoconfirmed',body:'مرحباً {{1}}! ✅\n\nتم تأكيد طلبك #{{2}} تلقائياً\n\nسيتم التجهيز والشحن قريباً 🚚\n\nشكراً لثقتك في myMayz 🙏\n\n— فريق myMayz 🌿', example:[['أحمد','53760']] },
     { name:'order_confirmed',    body:'مرحباً {{1}}! 🎉\n\nتم تأكيد طلبك #{{2}} بنجاح ✅\n\nسيتم التجهيز والشحن قريباً\n\nشكراً لثقتك في myMayz 🙏\n\n— فريق myMayz 🌿', example:[['أحمد','53760']] },
