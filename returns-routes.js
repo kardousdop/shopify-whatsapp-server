@@ -17,7 +17,7 @@
 const express = require('express');
 const router  = express.Router();
 
-// ── CORS — allow requests from the returns portal ────────────────────
+// ── CORS — allow requests from the returns portal ─────────────────────
 router.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -211,6 +211,63 @@ router.get('/template-status', async (req, res) => {
   }
 });
 
+// ── GET /returns/template-components ─────────────────────────────────
+// Returns full template bodies + components from Meta (for debugging)
+router.get('/template-components', async (req, res) => {
+  if (req.headers['x-returns-secret'] !== SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const r = await fetch(
+      `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates?fields=name,status,language,category,components&limit=50`,
+      { headers: { 'Authorization': `Bearer ${process.env.META_ACCESS_TOKEN}` } }
+    );
+    const d = await r.json();
+    const ourNames = Object.values(TEMPLATES);
+    const filtered = (d.data || []).filter(t => ourNames.includes(t.name));
+    return res.json({ templates: filtered });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /returns/submit-approved-template ────────────────────────────
+// Submits the return_request_approved template to Meta for approval
+router.post('/submit-approved-template', async (req, res) => {
+  if (req.headers['x-returns-secret'] !== SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const templateBody = {
+    name: 'return_request_approved',
+    language: 'ar',
+    category: 'UTILITY',
+    components: [{
+      type: 'BODY',
+      text: 'مرحباً {{1}} 💋\n\nتمت الموافقة عملي طمب الإرجاٹ/الاستبدال الثاص وك ؅⌒\n\nيرجي تجهيز المنتج للشحن، وسيتواصل معك فريباً لتحديد موعد الاستلام.\n\n— فريق myMayz 🌿',
+      example: {
+        body_text: [['سارة', '#53760']]
+      }
+    }]
+  };
+  try {
+    const r = await fetch(
+      `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.META_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(templateBody)
+      }
+    );
+    const d = await r.json();
+    return res.json({ ok: r.ok, data: d });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;
 
 // ════════════════════════════════════════════════════════════════════
@@ -231,16 +288,16 @@ Language: ar
 Body (Arabic):
 مرحباً {{1}} 👋
 
-تم استلام طلب الإر٫bًع/ب�لاستبدب�ل الخاص بك بنجاح ✅
+تم استلام طلب الإرجاع/الاستبدال الخاص بك بنجاح ✅
 
-📦 رقم الطلب: {{2}}
-🔖 رقم المر٫bً: {{3}}
+📦 رقم الطمب: {{2}}
+🔖 رقم المرجع: {{3}}
 
-سنراجه طلبك ونتواصل معك قريباً fي حال احتجنا أي ميعلومات اضافيمي.
+سنراجع طمبك ونتواصل معك قريباً في حال احتجنا أي معلومات إضافية.
 
-— friq myMayz 🌿
+— فريق myMayz 🌿
 
-Example values: {{1}}=سارةٌ {{2}}=#53760ٌ {{3}}=REQ-ABC123
+Example values: {{1}}=sارة⌔ {{2}}=#53760، {{3}}=REQ-ABC123
 
 ──────────────────────────────────────────────────
 TEMPLATE 2: return_request_approved
@@ -252,12 +309,11 @@ Language: ar
 Body (Arabic):
 مرحباً {{1}} 👋
 
-تمت الموافقة عممي طلب الإر٫bً-الاستبدب�ل الخاص بك ✅
+تمت الموافقة على طلب الإرجاع/الاستبدال الخاص بك ✅
 
 📦 رقم الطلب: {{2}}
-	يرجو تتجهيس المنتb٠ للش٭bن,و سيتواصل معك فريفن ال٩تتديد مىاbً الاستلام.
 
-
+يرجى تجهيز المنتج للشحن، وسيتواصل معك فريقنا قريباً لتحديد موعد الاستلام.
 
 — فريق myMayz 🌿
 
@@ -273,10 +329,11 @@ Language: ar
 Body (Arabic):
 مرحباً {{1}} 👋
 
-وصل منتثك إلى محذن myMayz بنتجاح 📓✅
+وصل منتجك إلى مٮزن myMayz بنجاح 📦✅
 
 📦 رقم الطلب: {{2}}
-	٫اري مرا٫عني حاله المنتج. سيتم معهلٙه طلبك خلال 1–2يوم عمل.
+
+جاري مراجعة حالة المنتج. سيتم معالجة طمبك خمال 1–2 يوم عمل.
 
 — فريق myMayz 🌿
 
@@ -292,12 +349,12 @@ Language: ar
 Body (Arabic):
 مرحباً {{1}} 👋
 
-تم إنثاء بوليصة الاستلام منتجك 🚙
+تم إنشاء بوليصة الشحن لاستلام منتجك 🚚
 
 📦 رقم الطلب: {{2}}
-📉 رقم البوليصة: {{3}}
+📋 رقم البوليصة: {{3}}
 
-المندوب سيتواصل مصك قريباً لتحديد موعوء الاستلام. يرجو تتحديد موظ�bً لتسليم.
+المندوب سيتواصل معك قريباً لتحديد موعد الاستلام. يرجى تجهيز المنتج للتسليم.
 
 — فريق myMayz 🌿
 
@@ -318,10 +375,10 @@ Body (Arabic):
 📦 رقم الطلب: {{2}}
 💵 المبلغ: {{3}}
 
-يرتين التحقق من حساتbك. في حال عدم الاستلام خلال 24 ساعة تواصل معمن.
+يرجى التحقق من حسابك. في حال عدم الاستلام خلال 24 ساعة تواصل معنا.
 
-— friq myMayz 🌿
+— فريق myMayz 🌿
 
-Example values: {{1}}=سارةٌ {{2}}=#53760ٌ {{3}}=1200 EGP
+Example values: {{1}}=سارة، {{2}}=#53760، {{3}}=1200 EGP
 ──────────────────────────────────────────────────
 */
