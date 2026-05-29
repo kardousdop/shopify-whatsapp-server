@@ -231,24 +231,17 @@ router.get('/template-components', async (req, res) => {
   }
 });
 
-// ── POST /returns/submit-approved-template ────────────────────────────
-// Submits the return_request_approved template to Meta for approval
-router.post('/submit-approved-template', async (req, res) => {
+// ── POST /returns/submit-template ────────────────────────────────────
+// Proxies a template submission to Meta. Send the full templateBody in req.body.
+// Body: { templateBody: { name, language, category, components: [...] } }
+router.post('/submit-template', async (req, res) => {
   if (req.headers['x-returns-secret'] !== SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const templateBody = {
-    name: 'return_request_approved',
-    language: 'ar',
-    category: 'UTILITY',
-    components: [{
-      type: 'BODY',
-      text: 'مرحباً {{1}} 💋\n\nتمت الموافقة عملي طمب الإرجاٹ/الاستبدال الثاص وك ؅⌒\n\nيرجي تجهيز المنتج للشحن، وسيتواصل معك فريباً لتحديد موعد الاستلام.\n\n— فريق myMayz 🌿',
-      example: {
-        body_text: [['سارة', '#53760']]
-      }
-    }]
-  };
+  const { templateBody } = req.body || {};
+  if (!templateBody) {
+    return res.status(400).json({ error: 'Missing templateBody in request body' });
+  }
   try {
     const r = await fetch(
       `https://graph.facebook.com/v19.0/${WABA_ID}/message_templates`,
@@ -290,14 +283,14 @@ Body (Arabic):
 
 تم استلام طلب الإرجاع/الاستبدال الخاص بك بنجاح ✅
 
-📦 رقم الطمب: {{2}}
+📦 رقم الطلب: {{2}}
 🔖 رقم المرجع: {{3}}
 
-سنراجع طمبك ونتواصل معك قريباً في حال احتجنا أي معلومات إضافية.
+سنراجع طلبك ونتواصل معك قريباً في حال احتجنا أي معلومات إضافية.
 
 — فريق myMayz 🌿
 
-Example values: {{1}}=sارة⌔ {{2}}=#53760، {{3}}=REQ-ABC123
+Example values: {{1}}=سارة، {{2}}=#53760، {{3}}=REQ-ABC123
 
 ──────────────────────────────────────────────────
 TEMPLATE 2: return_request_approved
@@ -329,11 +322,11 @@ Language: ar
 Body (Arabic):
 مرحباً {{1}} 👋
 
-وصل منتجك إلى مٮزن myMayz بنجاح 📦✅
+وصل منتجك إلى مخزن myMayz بنجاح 📦✅
 
 📦 رقم الطلب: {{2}}
 
-جاري مراجعة حالة المنتج. سيتم معالجة طمبك خمال 1–2 يوم عمل.
+جاري مراجعة حالة المنتج. سيتم معالجة طلبك خلال 1–2 يوم عمل.
 
 — فريق myMayz 🌿
 
@@ -379,6 +372,6 @@ Body (Arabic):
 
 — فريق myMayz 🌿
 
-Example values: {{1}}=سارة، {{2}}=#53760، {{3}}=1200 EGP
+Example values: {{1}}}سارة، {{2}}=#53760، {{3}}=1200 EGP
 ──────────────────────────────────────────────────
 */
