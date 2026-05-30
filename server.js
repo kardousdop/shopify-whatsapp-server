@@ -1,5 +1,6 @@
 // ================================================================
 // shopify-whatsapp-server — server.js
+// Last deploy: 2026-05-30 08:10 UTC
 // Features:
 // ✅ COD orders  — confirmation flow (1/2 reply) → COD-Confirmed / COD-Cancelled
 // ✅ Paid orders — simple receipt message → tagged 'Paid' immediately, no reply needed
@@ -855,3 +856,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   restoreOrderTimers();
 });
+
