@@ -661,6 +661,25 @@ app.post('/webhook/meta', async (req, res) => {
     if (statuses) {
       for (const s of statuses) {
         console.log(`📬 Meta delivery: id=${s.id} status=${s.status} to=${s.recipient_id}${s.errors ? ' errors='+JSON.stringify(s.errors) : ''}`);
+        // Update tracked notification by wamid (no-downgrade: never let a late
+        // 'delivered' overwrite 'read', etc.). Best-effort — table may not exist.
+        try {
+          const prevAllowed = {
+            sent:      ['__none__'],            // initial state already 'sent'
+            delivered: ['sent'],
+            read:      ['sent', 'delivered'],
+            failed:    ['sent']
+          }[s.status];
+          if (prevAllowed && s.id) {
+            await supabase
+              .from('mm_wa_delivery')
+              .update({ status: s.status, error: s.errors || null, updated_at: new Date().toISOString() })
+              .eq('wamid', s.id)
+              .in('status', prevAllowed);
+          }
+        } catch (e) {
+          console.warn('mm_wa_delivery status update non-fatal:', e.message);
+        }
       }
     }
     const messages = changes?.messages;

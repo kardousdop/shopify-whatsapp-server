@@ -16,6 +16,13 @@
 
 const express = require('express');
 const router  = express.Router();
+const { createClient } = require('@supabase/supabase-js');
+
+// Supabase client for delivery tracking (mm_wa_delivery). Optional — if the env
+// vars or table are missing, tracking is skipped and sends still work.
+const _sb = (process.env.SUPABASE_URL && process.env.SUPABASE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+  : null;
 
 // ── CORS — allow requests from the returns portal ─────────────────────
 router.use((req, res, next) => {
@@ -175,6 +182,25 @@ router.post('/notify', async (req, res) => {
         return res.status(400).json({ error: 'Unknown trigger: ' + trigger });
     }
 
+    // ── Record this send for delivery tracking (best-effort) ──────────
+    if (_sb) {
+      const wamid = result?.data?.messages?.[0]?.id || null;
+      try {
+        await _sb.from('mm_wa_delivery').insert({
+          wamid,
+          phone:    normalizePhone(phone),
+          trigger,
+          template: TEMPLATES[trigger] || null,
+          ord_name: ordName || null,
+          req_id:   reqId ? String(reqId) : null,
+          status:   result?.ok ? 'sent' : 'failed',
+          error:    result?.ok ? null : (result?.data?.error || { reason: result?.reason || 'send_failed' })
+        });
+      } catch (e) {
+        console.warn('[Returns WA] delivery insert non-fatal:', e.message);
+      }
+    }
+
     return res.json(result);
   } catch (e) {
     console.error('[Returns WA] Unhandled error:', e);
@@ -190,6 +216,31 @@ router.get('/health', (req, res) => {
     phoneId: PHONE_ID,
     hasToken: !!process.env.META_ACCESS_TOKEN
   });
+});
+
+// ── GET /returns/delivery?ordName=#53760 ─────────────────────────────
+// Returns the notification delivery rows for an order, newest first, so the
+// returns portal can show ✓✓ Delivered / Read / ✗ Failed per notification.
+router.get('/delivery', async (req, res) => {
+  if (req.headers['x-returns-secret'] !== SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (!_sb) return res.json([]);
+  const { ordName, phone } = req.query;
+  try {
+    let q = _sb.from('mm_wa_delivery')
+      .select('wamid, trigger, template, ord_name, req_id, status, error, created_at, updated_at')
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (ordName)      q = q.eq('ord_name', ordName);
+    else if (phone)   q = q.eq('phone', normalizePhone(phone));
+    else return res.status(400).json({ error: 'ordName or phone required' });
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json(data || []);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 // ── GET /returns/template-status ─────────────────────────────────────
