@@ -50,21 +50,66 @@ const TEMPLATES = {
   refund_processed:   'return_refund_processed',     // params: name, ordName, amount
 };
 
-// ── Phone normalizer (Egyptian numbers) ──────────────────────────────
-function normalizePhone(p) {
-  p = (p || '').replace(/\D/g, '');
-  if (p.startsWith('0'))              p = '20' + p.slice(1);
-  if (!p.startsWith('20') && p.length >= 10) p = '20' + p;
-  return p;
+// ── Phone normalizer ─────────────────────────────────────────────────
+// Returns { ok, phone, reason }. NEVER blind-prefixes a country code.
+//
+// The previous version assumed every customer was Egyptian: it stripped a
+// leading 0 and stapled '20' onto the front of ANYTHING. That silently
+// corrupted every non-Egyptian number — a Jordanian customer whose number is
+// 0796244441 (or 00962796244441) became 20796244441 / 200962796244441, numbers
+// that do not exist. Meta ACCEPTS such a send and only later returns delivery
+// error 131026 "Message undeliverable", so it looked like a working send while
+// the customer got nothing. 64 return-lifecycle notifications were lost this way
+// in the first 8 days of Aug 2026 (order #59209 was the reported case).
+//
+// Rules, in order:
+//   • '00' is the international access code → strip it, then re-test.
+//   • Anything that looks like an Egyptian mobile (1[0125] + 8 digits, with or
+//     without the 20 / leading 0) → normalise to 20XXXXXXXXXX.
+//   • An explicitly international number (+cc… / 00cc…) → trust it as-is.
+//   • Everything else (a foreign LOCAL number like 079…, an Egyptian landline
+//     like 02…, or junk) → reject. The country cannot be inferred from the
+//     digits alone, and guessing is what caused this bug. Skipping is reported
+//     back so CS can fix the number, instead of burning a send nobody receives.
+const EG_MOBILE = /^1[0125]\d{8}$/;   // Egyptian mobile, no leading 0
+
+function normalizePhone(raw) {
+  const s = String(raw || '').trim();
+  const hadPlus = s.startsWith('+');
+  let p = s.replace(/\D/g, '');
+  if (!p) return { ok: false, reason: 'empty', phone: '' };
+
+  let hadIntlPrefix = hadPlus;
+  if (p.startsWith('00')) { p = p.slice(2); hadIntlPrefix = true; }
+
+  // Egyptian, already carrying the country code
+  if (p.startsWith('20') && EG_MOBILE.test(p.slice(2))) return okPhone(p);
+  // Egyptian, bare local form (with or without the trunk 0)
+  if (EG_MOBILE.test(p))                                 return okPhone('20' + p);
+  if (p.startsWith('0') && EG_MOBILE.test(p.slice(1)))   return okPhone('20' + p.slice(1));
+  // Trunk 0 typed in front of the country code: 0 20 1XXXXXXXXX
+  if (p.startsWith('020') && EG_MOBILE.test(p.slice(3))) return okPhone(p.slice(1));
+  // Explicitly international and not Egyptian — trust the country code it came with
+  if (hadIntlPrefix)                                     return okPhone(p);
+
+  return { ok: false, reason: 'unrecognised_number', phone: p };
+}
+
+function okPhone(p) {
+  // E.164 allows 8–15 digits; outside that it cannot be a real subscriber number
+  return (p.length >= 8 && p.length <= 15)
+    ? { ok: true, phone: p }
+    : { ok: false, reason: 'bad_length', phone: p };
 }
 
 // ── Core send function ────────────────────────────────────────────────
 async function sendTemplate(phone, templateName, params) {
-  const p = normalizePhone(phone);
-  if (!p || p.length < 11) {
-    console.warn('[Returns WA] Bad phone:', phone, '→', p);
-    return { ok: false, reason: 'bad_phone' };
+  const n = normalizePhone(phone);
+  if (!n.ok) {
+    console.warn('[Returns WA] Skipped — unusable phone:', JSON.stringify(phone), '→', n.phone, '(' + n.reason + ')');
+    return { ok: false, skipped: true, reason: n.reason, phone: n.phone };
   }
+  const p = n.phone;
 
   const body = {
     messaging_product: 'whatsapp',
@@ -186,15 +231,24 @@ router.post('/notify', async (req, res) => {
     if (_sb) {
       const wamid = result?.data?.messages?.[0]?.id || null;
       try {
+        // Record the number we ACTUALLY used; on a skip keep the raw digits so CS
+        // can see what the customer typed. 'skipped' is a distinct status from
+        // 'failed' — nothing was sent to Meta, the number itself is unusable.
+        const _n = normalizePhone(phone);
         await _sb.from('mm_wa_delivery').insert({
           wamid,
-          phone:    normalizePhone(phone),
+          phone:    _n.phone || String(phone || '').replace(/\D/g, ''),
           trigger,
           template: TEMPLATES[trigger] || null,
           ord_name: ordName || null,
           req_id:   reqId ? String(reqId) : null,
-          status:   result?.ok ? 'sent' : 'failed',
-          error:    result?.ok ? null : (result?.data?.error || { reason: result?.reason || 'send_failed' })
+          status:   result?.ok ? 'sent' : (result?.skipped ? 'skipped' : 'failed'),
+          error:    result?.ok ? null : (result?.data?.error || {
+                      reason:  result?.reason || 'send_failed',
+                      message: result?.skipped
+                        ? 'Phone number is not a usable WhatsApp number — nothing was sent. Fix the number on the order and resend.'
+                        : undefined
+                    })
         });
       } catch (e) {
         console.warn('[Returns WA] delivery insert non-fatal:', e.message);
