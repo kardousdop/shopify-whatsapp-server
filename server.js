@@ -26,7 +26,7 @@ const app = express();
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,x-admin-secret');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,x-admin-secret,x-returns-secret');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -56,9 +56,22 @@ const {
   PORT = 3000
 } = process.env;
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'mymayz-verify-2024';
+// Owner number that receives the daily WhatsApp delivery report + instant problem alerts
+const OWNER_PHONE = process.env.OWNER_PHONE || '201004444558';
 
 // WhatsApp Business Account ID (for template submission)
 const WABA_ID = process.env.WABA_ID || '900960922811775';
+
+// Abandoned-checkout reminder: 10% discount code shown in the message and
+// pre-applied on the recovery link. Template cart_reminder_discount ({{1}} name,
+// {{2}} items, {{3}} total, {{4}} code, {{5}} url); falls back to the old
+// 4-param cart_reminder until the new template is approved by Meta.
+const ABANDONED_DISCOUNT_CODE = process.env.ABANDONED_DISCOUNT_CODE || 'SBYGWOL10';
+const ABANDONED_TEMPLATE      = process.env.ABANDONED_TEMPLATE || 'cart_reminder_discount';
+function withDiscount(url) {
+  if (!url || !ABANDONED_DISCOUNT_CODE || /[?&]discount=/.test(url)) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'discount=' + encodeURIComponent(ABANDONED_DISCOUNT_CODE);
+}
 
 // ── Supabase client ──────────────────────────────────────────────
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -243,7 +256,7 @@ app.post('/webhook/checkout', async (req, res) => {
                 'عميلنا';
   const items = (checkout.line_items || []).map(i => `${i.title} ×${i.quantity}`).join('، ');
   const total = checkout.total_price || '0.00';
-  const url   = checkout.abandoned_checkout_url || 'https://mymayz.com';
+  const url   = withDiscount(checkout.abandoned_checkout_url || 'https://mymayz.com');
 
   const scheduledAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
@@ -270,6 +283,20 @@ app.post('/webhook/checkout', async (req, res) => {
 
 // ================================================================
 // 3. CRON — SEND DUE ABANDONED CHECKOUT REMINDERS
+// Send one abandoned-cart reminder: discount template first, old template as fallback
+// (Meta error 132001 = template not found / not approved yet).
+async function sendCartReminder(row) {
+  const url = withDiscount(row.checkout_url);
+  const data = await sendWATemplate(row.phone, ABANDONED_TEMPLATE, 'ar', [
+    row.cust_name, row.items, row.total, ABANDONED_DISCOUNT_CODE, url
+  ]);
+  if (data?.error) {
+    console.warn(`↩️ ${ABANDONED_TEMPLATE} failed (${data.error.code}), falling back to cart_reminder for ${row.phone}`);
+    return sendWATemplate(row.phone, 'cart_reminder', 'ar', [row.cust_name, row.items, row.total, url]);
+  }
+  return data;
+}
+
 // GET /cron/send-abandoned?secret=mymayz-admin-2024
 // ================================================================
 app.get('/cron/send-abandoned', requireAdminAuth, async (req, res) => {
@@ -295,9 +322,7 @@ app.get('/cron/send-abandoned', requireAdminAuth, async (req, res) => {
 
   for (const row of dueRows) {
     try {
-      await sendWATemplate(row.phone, 'cart_reminder', 'ar', [
-        row.cust_name, row.items, row.total, row.checkout_url
-      ]);
+      await sendCartReminder(row);
 
       await supabase
         .from('mm_abandoned_checkouts')
@@ -521,6 +546,159 @@ async function sendWAText(phone, message) {
 }
 
 // ================================================================
+// WHATSAPP HEALTH MONITORING — daily report + instant alerts to owner
+// ================================================================
+let _lastOwnerAlert = 0;          // throttle systemic alerts to 1/hour
+let _lastDailyReportDay = null;   // Cairo YYYY-MM-DD of the last daily report sent
+
+// Best-effort owner alert (throttled). NOTE: if the account is fully locked,
+// this WA send itself will fail — the daily report (and its absence) is the backstop.
+async function maybeAlertOwner(message) {
+  const now = Date.now();
+  if (now - _lastOwnerAlert < 60 * 60 * 1000) return;
+  _lastOwnerAlert = now;
+  try { await sendWAText(OWNER_PHONE, message); console.log('🔔 Owner alert sent'); }
+  catch (e) { console.error('🔔❌ Owner alert FAILED (channel may be down):', e.message); }
+}
+
+// Live account health via Graph (works as a read even if messaging is limited)
+async function fetchWAHealth() {
+  try {
+    const r = await fetch(
+      `https://graph.facebook.com/v19.0/${META_PHONE_NUMBER_ID}?fields=health_status,quality_rating`,
+      { headers: { 'Authorization': `Bearer ${META_ACCESS_TOKEN}` } }
+    );
+    const d = await r.json();
+    if (d.error) return { ok: false, label: `❗ API/token error ${d.error.code}` };
+    const cs = d.health_status?.can_send_message;
+    return { ok: cs === 'AVAILABLE', canSend: cs, quality: d.quality_rating,
+             label: cs === 'AVAILABLE' ? `✅ AVAILABLE (${d.quality_rating || '—'})` : `❗ ${cs || 'NOT available'}` };
+  } catch (e) { return { ok: false, label: `❗ ${e.message}` }; }
+}
+
+// Build the last-24h delivery summary text (Arabic) + a problem flag
+async function buildDailyReport() {
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  let rows = [];
+  try {
+    const { data } = await supabase
+      .from('mm_wa_delivery')
+      .select('status,error,created_at')
+      .gte('created_at', since);
+    rows = data || [];
+  } catch (e) { console.warn('buildDailyReport query non-fatal:', e.message); }
+
+  const c = { sent: 0, delivered: 0, read: 0, failed: 0 };
+  const failBy = {};
+  for (const r of rows) {
+    if (c[r.status] !== undefined) c[r.status]++;
+    if (r.status === 'failed') {
+      const code = (Array.isArray(r.error) && r.error[0]?.code) || r.error?.code || '?';
+      failBy[code] = (failBy[code] || 0) + 1;
+    }
+  }
+  const total = rows.length;
+  const reached = c.delivered + c.read;        // delivered or read = arrived at the customer
+  const health = await fetchWAHealth();
+  const failLine = c.failed > 0
+    ? `\n⚠️ فشل: ${c.failed}` + (Object.keys(failBy).length ? ` (${Object.entries(failBy).map(([k, v]) => `${v}×${k}`).join(', ')})` : '')
+    : '';
+  const text =
+    `📊 myMayz WhatsApp — آخر ٢٤ ساعة\n` +
+    `إجمالي الرسائل: ${total}\n` +
+    `✅ وصلت للعميل: ${reached}  (تم التسليم ${c.delivered} · تمت القراءة ${c.read})\n` +
+    `⏳ في الانتظار: ${c.sent}` +
+    failLine + `\n` +
+    `حالة الحساب: ${health.label}`;
+  const problem = !health.ok || c.failed > 0;
+  // Params for the `daily_wa_report` template (must be single-line, non-empty).
+  const failSummary = c.failed > 0
+    ? `${c.failed}` + (Object.keys(failBy).length ? ` (${Object.entries(failBy).map(([k, v]) => `${v}×${k}`).join(', ')})` : '')
+    : '0';
+  const params = [String(total), String(reached), String(c.sent), failSummary, health.label || '—'];
+  return { text, problem, counts: c, total, health, params };
+}
+
+async function sendDailyReport(reason) {
+  const rep = await buildDailyReport();
+  // Prefer the approved UTILITY template `daily_wa_report` — templates deliver
+  // even when the owner's 24h customer-service window is closed (free-form text
+  // fails there with error 131047). Fall back to free-form only if the template
+  // isn't approved yet / errors.
+  let sentVia = null;
+  try {
+    const r = await sendWATemplate(OWNER_PHONE, 'daily_wa_report', 'ar', rep.params);
+    if (r && r.messages && !r.error) sentVia = 'template';
+  } catch (e) { /* fall through to text */ }
+  if (!sentVia) {
+    const prefix = rep.problem ? '🚨 تنبيه — ' : '';
+    try {
+      await sendWAText(OWNER_PHONE, prefix + rep.text);
+      sentVia = 'text';
+    } catch (e) {
+      console.error('📊❌ Daily report send failed (template + text both failed):', e.message);
+    }
+  }
+  console.log(`📊 Daily WA report sent via ${sentVia || 'NONE'} (${reason}) — problem=${rep.problem}`);
+  return rep;
+}
+
+// Internal scheduler — fires the daily report once per day at ~09:00 Africa/Cairo.
+// Self-contained (no external cron needed); the server runs 24/7 on Railway.
+function startWAReportScheduler() {
+  setInterval(async () => {
+    try {
+      const cairo = new Date().toLocaleString('en-CA', { timeZone: 'Africa/Cairo', hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit' });
+      // cairo like "2026-06-19, 09" → split date + hour
+      const [datePart, hourPart] = cairo.split(', ');
+      const hour = parseInt(hourPart, 10);
+      if (hour >= 9 && _lastDailyReportDay !== datePart) {
+        _lastDailyReportDay = datePart;
+        await sendDailyReport('scheduled-09:00-Cairo');
+      }
+    } catch (e) { console.warn('WA report scheduler tick non-fatal:', e.message); }
+  }, 10 * 60 * 1000); // check every 10 minutes
+  console.log('🕘 WhatsApp daily-report scheduler started (09:00 Africa/Cairo)');
+}
+
+// Internal scheduler — flushes due abandoned-checkout reminders every 5 min.
+// Self-contained (no external cron). Same logic as the standalone
+// GET /cron/send-abandoned route, which is left untouched for manual runs; this
+// just guarantees the queue never sits unsent waiting on an external scheduler.
+async function sendDueAbandoned() {
+  const now = new Date().toISOString();
+  const { data: dueRows, error } = await supabase
+    .from('mm_abandoned_checkouts')
+    .select('*')
+    .eq('sent', false)
+    .lte('scheduled_at', now);
+  if (error) { console.warn('abandoned scheduler fetch non-fatal:', error.message); return; }
+  if (!dueRows || dueRows.length === 0) return;
+  console.log(`🛒 Scheduler: ${dueRows.length} abandoned reminder(s) due`);
+  for (const row of dueRows) {
+    try {
+      await sendCartReminder(row);
+      await supabase
+        .from('mm_abandoned_checkouts')
+        .update({ sent: true, sent_at: new Date().toISOString() })
+        .eq('id', row.id);
+      console.log(`📤 Abandoned reminder sent to ${row.phone}`);
+    } catch (e) {
+      console.error(`❌ Abandoned reminder failed for ${row.phone}:`, e.message);
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+}
+
+function startAbandonedScheduler() {
+  setInterval(() => {
+    sendDueAbandoned().catch(e => console.warn('abandoned scheduler tick non-fatal:', e.message));
+  }, 5 * 60 * 1000); // every 5 minutes
+  console.log('🛒 Abandoned-checkout scheduler started (every 5 min)');
+}
+
+// ================================================================
 // HELPERS
 // ================================================================
 function normalisePhone(phone) {
@@ -599,7 +777,7 @@ app.post('/admin/bulk-send', requireAdminAuth, async (req, res) => {
 app.get('/admin/test-abandoned', requireAdminAuth, async (req, res) => {
   const phone = req.query.phone;
   if (!phone) return res.json({ error: 'phone param required' });
-  await sendWATemplate(phone, 'cart_reminder', 'ar', ['عميلنا','Alkaline Clay Water Bottle ×1','784','https://mymayz.com']);
+  await sendCartReminder({ phone, cust_name: 'عميلنا', items: 'Alkaline Clay Water Bottle ×1', total: '784', checkout_url: 'https://mymayz.com' });
   console.log(`🧪 Test abandoned template sent to ${phone}`);
   res.json({ sent: true, to: phone });
 });
@@ -661,24 +839,39 @@ app.post('/webhook/meta', async (req, res) => {
     if (statuses) {
       for (const s of statuses) {
         console.log(`📬 Meta delivery: id=${s.id} status=${s.status} to=${s.recipient_id}${s.errors ? ' errors='+JSON.stringify(s.errors) : ''}`);
-        // Update tracked notification by wamid (no-downgrade: never let a late
-        // 'delivered' overwrite 'read', etc.). Best-effort — table may not exist.
+        if (!s.id) continue;
+        // Capture EVERY receipt so the daily report reflects what actually reached customers
+        // (orders + returns alike). Insert if this wamid isn't tracked yet; else no-downgrade update
+        // (never let a late 'delivered' overwrite 'read', etc.). Best-effort.
         try {
-          const prevAllowed = {
-            sent:      ['__none__'],            // initial state already 'sent'
-            delivered: ['sent'],
-            read:      ['sent', 'delivered'],
-            failed:    ['sent']
-          }[s.status];
-          if (prevAllowed && s.id) {
-            await supabase
-              .from('mm_wa_delivery')
-              .update({ status: s.status, error: s.errors || null, updated_at: new Date().toISOString() })
-              .eq('wamid', s.id)
-              .in('status', prevAllowed);
+          const { data: existing } = await supabase
+            .from('mm_wa_delivery').select('status').eq('wamid', s.id).maybeSingle();
+          if (!existing) {
+            await supabase.from('mm_wa_delivery').insert({
+              wamid: s.id, phone: s.recipient_id || null, trigger: 'outbound',
+              status: s.status, error: s.errors || null
+            });
+          } else {
+            const prevAllowed = {
+              delivered: ['sent'],
+              read:      ['sent', 'delivered'],
+              failed:    ['sent', 'delivered']
+            }[s.status];
+            if (prevAllowed && prevAllowed.includes(existing.status)) {
+              await supabase.from('mm_wa_delivery')
+                .update({ status: s.status, error: s.errors || null, updated_at: new Date().toISOString() })
+                .eq('wamid', s.id);
+            }
           }
         } catch (e) {
-          console.warn('mm_wa_delivery status update non-fatal:', e.message);
+          console.warn('mm_wa_delivery upsert non-fatal:', e.message);
+        }
+        // Instant alert on a SYSTEMIC failure (account lock / auth / throughput) — throttled 1/hour.
+        if (s.status === 'failed') {
+          const code = s.errors?.[0]?.code;
+          if ([131031, 190, 131056, 133010, 133004, 131045].includes(code)) {
+            maybeAlertOwner(`⚠️ مشكلة في إرسال واتساب (خطأ ${code}: ${s.errors?.[0]?.title || ''}). العملاء قد لا يستلمون الرسائل — راجع حساب واتساب.`);
+          }
         }
       }
     }
@@ -867,12 +1060,46 @@ app.get('/submit-abandoned-template', requireAdminAuth, async (req, res) => {
 });
 
 // ================================================================
+// SUBMIT CART REMINDER + DISCOUNT TEMPLATE  (GET /submit-abandoned-discount-template?secret=)
+// ================================================================
+app.get('/submit-abandoned-discount-template', requireAdminAuth, async (req, res) => {
+  const headers = { 'Authorization': `Bearer ${META_ACCESS_TOKEN}`, 'Content-Type': 'application/json' };
+  const templateName = 'cart_reminder_discount';
+  const body = 'مرحباً {{1}}! 🛒\n\nلاحظنا أنك تركت بعض المنتجات في سلة التسوق:\n🛍️ {{2}}\n💰 {{3}} EGP\n\n🎁 هدية منا: خصم 10% على طلبك بالكود {{4}}\n\nأكمل طلبك الآن والخصم هيتطبق تلقائياً 👇\n{{5}}\n\n— فريق myMayz 🌿';
+  try {
+    const submitR = await fetch(`https://graph.facebook.com/v19.0/${WABA_ID}/message_templates`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ name: templateName, language: 'ar', category: 'MARKETING',
+        components: [{ type: 'BODY', text: body, example: { body_text: [['أحمد','Alkaline Clay Water Bottle ×1','784','SBYGWOL10','https://mymayz.com']] } }] })
+    });
+    const submitData = await submitR.json();
+    console.log(`📋 Submit "${templateName}" as MARKETING: ${submitR.ok ? '✅' : '❌'} — ${JSON.stringify(submitData)}`);
+    res.json({ submitResult: submitData, ok: submitR.ok });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ================================================================
 // START
 // ================================================================
 app.use('/returns', returnsRouter);
 
+// On-demand WhatsApp delivery report (also lets us test the daily report immediately).
+// GET /wa/health-report?secret=...   → sends the report to the owner + returns it as JSON
+app.get('/wa/health-report', requireAdminAuth, async (req, res) => {
+  try {
+    const rep = await sendDailyReport('manual');
+    res.json({ ok: true, problem: rep.problem, total: rep.total, counts: rep.counts, sentTo: OWNER_PHONE, text: rep.text });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   restoreOrderTimers();
+  startWAReportScheduler();
+  startAbandonedScheduler();
 });
 
