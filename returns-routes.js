@@ -8,7 +8,8 @@
  *       const returnsRouter = require('./returns-routes');
  *       app.use('/returns', returnsRouter);
  *  3. Add env variable in Railway:
- *       RETURNS_SECRET=mymayz-returns-2024
+ *       RETURNS_SECRET=<long random string — also set as the Cloudflare Pages
+ *       secret WA_RETURNS_SECRET on mymayz-returns; the browser never sees it>
  *  4. Submit the 4 WhatsApp templates in Meta Business Manager
  *     (template content is at the bottom of this file)
  *  5. Once templates are APPROVED, fill in their names below
@@ -35,7 +36,10 @@ router.use((req, res, next) => {
 
 // ── Config ────────────────────────────────────────────────────────────
 const PHONE_ID = process.env.META_PHONE_NUMBER_ID || '1091672370692388';
-const SECRET   = process.env.RETURNS_SECRET       || 'mymayz-returns-2024';
+// No fallback on purpose: if RETURNS_SECRET is unset every /returns call is
+// refused (fail-closed) rather than silently accepting a value that once shipped
+// inside the public returns app.
+const SECRET   = process.env.RETURNS_SECRET       || '';
 
 // WhatsApp Business Account ID (used for template-status endpoint)
 const WABA_ID = process.env.WABA_ID || '900960922811775';
@@ -162,7 +166,7 @@ async function sendTemplate(phone, templateName, params) {
 router.post('/notify', async (req, res) => {
   // Auth
   const secret = req.headers['x-returns-secret'];
-  if (secret !== SECRET) {
+  if (!SECRET || secret !== SECRET) {
     console.warn('[Returns WA] Unauthorized request from', req.ip);
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -195,11 +199,8 @@ router.post('/notify', async (req, res) => {
         break;
 
       case 'warehouse_received':
-        result = await sendTemplate(phone, TEMPLATES.warehouse_received, [
-          safeName,
-          safeOrdName
-        ]);
-        break;
+        // Disabled 2026-10-01 (Meta utility pricing) — skip without sending
+        return res.json({ ok: true, skipped: 'warehouse_received disabled' });
 
       case 'awb_created':
         result = await sendTemplate(phone, TEMPLATES.awb_created, [
@@ -276,7 +277,7 @@ router.get('/health', (req, res) => {
 // Returns the notification delivery rows for an order, newest first, so the
 // returns portal can show ✓✓ Delivered / Read / ✗ Failed per notification.
 router.get('/delivery', async (req, res) => {
-  if (req.headers['x-returns-secret'] !== SECRET) {
+  if (!SECRET || req.headers['x-returns-secret'] !== SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   if (!_sb) return res.json([]);
@@ -299,7 +300,7 @@ router.get('/delivery', async (req, res) => {
 
 // ── GET /returns/template-status ─────────────────────────────────────
 router.get('/template-status', async (req, res) => {
-  if (req.headers['x-returns-secret'] !== SECRET) {
+  if (!SECRET || req.headers['x-returns-secret'] !== SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
@@ -319,7 +320,7 @@ router.get('/template-status', async (req, res) => {
 // ── GET /returns/template-components ─────────────────────────────────
 // Returns full template bodies + components from Meta (for debugging)
 router.get('/template-components', async (req, res) => {
-  if (req.headers['x-returns-secret'] !== SECRET) {
+  if (!SECRET || req.headers['x-returns-secret'] !== SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
@@ -340,7 +341,7 @@ router.get('/template-components', async (req, res) => {
 // Proxies a template submission to Meta. Send the full templateBody in req.body.
 // Body: { templateBody: { name, language, category, components: [...] } }
 router.post('/submit-template', async (req, res) => {
-  if (req.headers['x-returns-secret'] !== SECRET) {
+  if (!SECRET || req.headers['x-returns-secret'] !== SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   const { templateBody } = req.body || {};

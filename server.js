@@ -421,7 +421,7 @@ async function retryIfNoReply(phone) {
   if (!order || order.confirmed || order.cancelled || order.retried) return;
   order.retried = true;
   await savePendingOrder(phone, order);
-  await sendWATemplate(phone, ORDER_TEMPLATES.reminder, 'ar', [order.name, String(order.orderNo)]);
+  // order_reminder WA disabled 2026-10-01 (Meta utility pricing) — timer + auto-confirm still run
   setTimeout(() => autoConfirmIfNoReply(phone), 3 * 60 * 60 * 1000);
 }
 
@@ -430,7 +430,7 @@ async function autoConfirmIfNoReply(phone) {
   if (!order || order.confirmed || order.cancelled) return;
   order.confirmed = true;
   console.log(`⏰ Auto-confirming order #${order.orderNo} for ${phone} — no reply in 4 hours`);
-  await sendWATemplate(phone, ORDER_TEMPLATES.auto_confirmed, 'ar', [order.name, String(order.orderNo)]);
+  // order_autoconfirmed WA disabled 2026-10-01 (Meta utility pricing) — Shopify tag still applied
   const shopifyTag = order.isCOD ? 'COD-Confirmed' : 'Card-Confirmed';
   await tagShopifyOrder(order.shopifyId, shopifyTag);
   await deletePendingOrder(phone);
@@ -1099,7 +1099,7 @@ app.get('/wa/health-report', requireAdminAuth, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   restoreOrderTimers();
-  startWAReportScheduler();
+  // startWAReportScheduler();  // daily 9AM owner report disabled 2026-10-01 (Meta utility pricing)
   startAbandonedScheduler();
 });
 
